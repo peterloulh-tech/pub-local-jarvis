@@ -252,50 +252,39 @@ jobs:
             Tee-Object -FilePath $log
           "Resolved powershell.exe: $windowsPowerShell" | Tee-Object -FilePath $log -Append
 
-          $preflight = @'
+          $preflightScriptPath = Join-Path $env:RUNNER_TEMP "jarvis-windows-powershell-preflight.ps1"
+          $preflightScript = @'
           $ErrorActionPreference = "Stop"
-          try {
-              [Console]::OutputEncoding = [Text.Encoding]::UTF8
-              $OutputEncoding = [Text.Encoding]::UTF8
-              Write-Output ("PowerShell executable: " + (Get-Process -Id $PID).Path)
-              Write-Output ("PowerShell version: " + $PSVersionTable.PSVersion.ToString())
-              Write-Output ("PowerShell edition: " + $PSVersionTable.PSEdition)
-              Write-Output ("PSHOME: " + $PSHOME)
-              Write-Output ("PSModulePath: " + $env:PSModulePath)
-              if ($PSVersionTable.PSEdition -ne "Desktop" -or $PSVersionTable.PSVersion.Major -ne 5) {
-                  throw "powershell.exe did not start Windows PowerShell 5.1."
-              }
-
-              $utilityModules = @(Get-Module -ListAvailable -Name Microsoft.PowerShell.Utility)
-              if ($utilityModules.Count -eq 0) {
-                  throw "Microsoft.PowerShell.Utility is not discoverable through PSModulePath."
-              }
-              Write-Output "Discovered Microsoft.PowerShell.Utility modules:"
-              $utilityModules |
-                  Select-Object Name, Version, ModuleBase |
-                  Format-Table -AutoSize |
-                  Out-String |
-                  Write-Output
-
-              Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
-              $fileHashCommand = Get-Command Get-FileHash -ErrorAction Stop
-              Write-Output "Resolved Get-FileHash command:"
-              $fileHashCommand |
-                  Select-Object Name, CommandType, Source, Version, Definition |
-                  Format-List |
-                  Out-String |
-                  Write-Output
-              exit 0
-          } catch {
-              [Console]::Error.WriteLine("Windows PowerShell module preflight failed: " + $_.Exception.Message)
-              [Console]::Error.WriteLine($_ | Out-String)
-              exit 1
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $OutputEncoding = [Text.Encoding]::UTF8
+          Write-Output ("PowerShell executable: " + (Get-Process -Id $PID).Path)
+          Write-Output ("PowerShell version: " + $PSVersionTable.PSVersion.ToString())
+          Write-Output ("PowerShell edition: " + $PSVersionTable.PSEdition)
+          Write-Output ("PSModulePath: " + $env:PSModulePath)
+          if ($PSVersionTable.PSEdition -ne "Desktop" -or $PSVersionTable.PSVersion.Major -ne 5) {
+              throw "powershell.exe did not start Windows PowerShell 5.1."
           }
+          Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+          $fileHashCommand = Get-Command Get-FileHash -ErrorAction Stop
+          Write-Output ("Get-FileHash source: " + $fileHashCommand.Source)
+          Write-Output "Windows PowerShell standard module preflight passed."
+          exit 0
           '@
+          [IO.File]::WriteAllText(
+            $preflightScriptPath,
+            $preflightScript,
+            [Text.Encoding]::ASCII
+          )
 
-          & $windowsPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command $preflight 2>&1 |
-            Tee-Object -FilePath $log -Append
-          $preflightExitCode = $LASTEXITCODE
+          $preflightExitCode = 1
+          try {
+            & $windowsPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+              -File $preflightScriptPath 2>&1 |
+              Tee-Object -FilePath $log -Append
+            $preflightExitCode = $LASTEXITCODE
+          } finally {
+            Remove-Item -LiteralPath $preflightScriptPath -Force -ErrorAction SilentlyContinue
+          }
           if ($preflightExitCode -ne 0) {
             throw "Windows PowerShell module preflight failed with exit code $preflightExitCode."
           }
