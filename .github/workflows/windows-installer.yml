@@ -289,6 +289,106 @@ jobs:
             throw "Windows PowerShell module preflight failed with exit code $preflightExitCode."
           }
 
+      - name: 预检 Node 到 Windows PowerShell 环境传递
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $log = Join-Path $env:BUILD_LOG_DIR "node-powershell-preflight.log"
+          $nodeScriptPath = Join-Path $env:RUNNER_TEMP "jarvis-node-powershell-preflight.js"
+          $powerShellScriptPath = Join-Path $env:RUNNER_TEMP "jarvis-node-child-preflight.ps1"
+
+          $powerShellScript = @'
+          $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $OutputEncoding = [Text.Encoding]::UTF8
+          Write-Output ("Child PowerShell executable: " + (Get-Process -Id $PID).Path)
+          Write-Output ("Child PowerShell version: " + $PSVersionTable.PSVersion.ToString())
+          Write-Output ("Child PSModulePath: " + $env:PSModulePath)
+          Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+          $fileHashCommand = Get-Command Get-FileHash -ErrorAction Stop
+          Write-Output ("Child Get-FileHash source: " + $fileHashCommand.Source)
+          Write-Output "Node child_process Windows PowerShell preflight passed."
+          exit 0
+          '@
+
+          $nodeScript = @'
+          "use strict";
+
+          const { spawnSync } = require("node:child_process");
+
+          const powerShellScriptPath = process.argv[2];
+          const modulePathKeys = Object.keys(process.env)
+            .filter((key) => key.toLowerCase() === "psmodulepath")
+            .sort();
+
+          console.log(`Node executable: ${process.execPath}`);
+          console.log(`PSModulePath key count in Node: ${modulePathKeys.length}`);
+          for (const key of modulePathKeys) {
+            console.log(`${key}=${JSON.stringify(process.env[key])}`);
+          }
+          if (modulePathKeys.length === 0) {
+            console.error("Node did not inherit any PSModulePath environment variable.");
+            process.exit(1);
+          }
+
+          const child = spawnSync(
+            "powershell.exe",
+            [
+              "-NoLogo",
+              "-NoProfile",
+              "-ExecutionPolicy",
+              "Bypass",
+              "-File",
+              powerShellScriptPath,
+            ],
+            {
+              env: process.env,
+              encoding: "utf8",
+              windowsHide: true,
+            },
+          );
+
+          if (child.stdout) process.stdout.write(child.stdout);
+          if (child.stderr) process.stderr.write(child.stderr);
+          if (child.error) {
+            console.error(`Node failed to start powershell.exe: ${child.error.message}`);
+            process.exit(1);
+          }
+          if (child.status !== 0) {
+            console.error(
+              `Node-spawned powershell.exe failed with ${
+                child.signal ? `signal ${child.signal}` : `exit code ${child.status}`
+              }.`,
+            );
+            process.exit(child.status === null ? 1 : child.status);
+          }
+          console.log("Node environment transfer preflight passed.");
+          '@
+
+          [IO.File]::WriteAllText(
+            $powerShellScriptPath,
+            $powerShellScript,
+            [Text.Encoding]::ASCII
+          )
+          [IO.File]::WriteAllText(
+            $nodeScriptPath,
+            $nodeScript,
+            [Text.Encoding]::ASCII
+          )
+
+          $nodePreflightExitCode = 1
+          try {
+            & node $nodeScriptPath $powerShellScriptPath 2>&1 |
+              Tee-Object -FilePath $log
+            $nodePreflightExitCode = $LASTEXITCODE
+          } finally {
+            Remove-Item -LiteralPath $nodeScriptPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $powerShellScriptPath -Force -ErrorAction SilentlyContinue
+          }
+          if ($nodePreflightExitCode -ne 0) {
+            throw "Node to Windows PowerShell environment preflight failed with exit code $nodePreflightExitCode."
+          }
+
       - name: 构建 CPU/CUDA Worker、Python 后端和 NSIS 安装包
         working-directory: desktop
         shell: pwsh
