@@ -1,0 +1,295 @@
+name: 构建 Windows 安装包
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci-windows-installer
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-installer:
+    name: 构建 Windows 安装包
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    env:
+      CUDA_VERSION: 13.1.1
+      CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1
+      BUILD_LOG_DIR: ${{ runner.temp }}\jarvis-build-logs
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 准备构建日志目录
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path $env:BUILD_LOG_DIR -Force | Out-Null
+          $artifactBranch = "${{ github.ref_name }}" -replace '[^A-Za-z0-9._-]', '-'
+          "ARTIFACT_BRANCH=$artifactBranch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 配置 Node.js 22.22.3
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.22.3
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: 配置 Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: 定位并初始化 Visual Studio 2022
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "vswhere.exe was not found: $vswhere"
+          }
+
+          $installationPath = (& $vswhere -latest -products * -version '[17.0,18.0)' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath | Select-Object -First 1).Trim()
+          if (-not $installationPath) {
+            throw "Visual Studio 2022 with the x64 C++ toolchain was not found."
+          }
+
+          $devCommand = Join-Path $installationPath "Common7\Tools\VsDevCmd.bat"
+          if (-not (Test-Path -LiteralPath $devCommand -PathType Leaf)) {
+            throw "VsDevCmd.bat was not found: $devCommand"
+          }
+
+          $devEnvironment = & cmd.exe /d /s /c "`"$devCommand`" -no_logo -arch=x64 -host_arch=x64 >nul && set"
+          if ($LASTEXITCODE -ne 0) {
+            throw "VsDevCmd.bat failed with exit code $LASTEXITCODE."
+          }
+
+          $persistVariables = @(
+            "DevEnvDir",
+            "INCLUDE",
+            "LIB",
+            "LIBPATH",
+            "UCRTVersion",
+            "UniversalCRTSdkDir",
+            "VCINSTALLDIR",
+            "VCToolsInstallDir",
+            "VisualStudioVersion",
+            "VSINSTALLDIR",
+            "WindowsSdkBinPath",
+            "WindowsSdkDir",
+            "WindowsSDKVersion"
+          )
+          foreach ($line in $devEnvironment) {
+            $separator = $line.IndexOf('=')
+            if ($separator -le 0) { continue }
+            $name = $line.Substring(0, $separator)
+            $value = $line.Substring($separator + 1)
+            if ($name -ieq "PATH") {
+              $value.Split(';', [StringSplitOptions]::RemoveEmptyEntries) |
+                ForEach-Object { $_ | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append }
+            } elseif ($persistVariables -contains $name) {
+              "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+
+          "Visual Studio installation: $installationPath" |
+            Tee-Object -FilePath (Join-Path $env:BUILD_LOG_DIR "tool-versions.log")
+          & cmd.exe /d /s /c "`"$devCommand`" -no_logo -arch=x64 -host_arch=x64 >nul && cl.exe 2>&1" |
+            Tee-Object -FilePath (Join-Path $env:BUILD_LOG_DIR "tool-versions.log") -Append
+          if ($LASTEXITCODE -ne 0) {
+            throw "cl.exe version check failed with exit code $LASTEXITCODE."
+          }
+
+      - name: 输出 Node、Python、CMake 和 Ninja 版本
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $log = Join-Path $env:BUILD_LOG_DIR "tool-versions.log"
+          & node --version 2>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { throw "node --version failed." }
+          & npm --version 2>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { throw "npm --version failed." }
+          & python --version 2>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { throw "python --version failed." }
+          & python -m pip --version 2>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { throw "pip --version failed." }
+          & cmake --version 2>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { throw "cmake --version failed." }
+          & ninja --version 2>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { throw "ninja --version failed." }
+
+      - name: 安装 CUDA Toolkit 13.1.1 构建组件
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+          $installer = Join-Path $env:RUNNER_TEMP "cuda_13.1.1_windows_network.exe"
+          $installerUrl = "https://developer.download.nvidia.com/compute/cuda/13.1.1/network_installers/cuda_13.1.1_windows_network.exe"
+          $installLog = Join-Path $env:BUILD_LOG_DIR "cuda-install.log"
+
+          "Downloading CUDA network installer from $installerUrl" |
+            Tee-Object -FilePath $installLog
+          Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
+
+          $signature = Get-AuthenticodeSignature -FilePath $installer
+          "Installer signature status: $($signature.Status)" |
+            Tee-Object -FilePath $installLog -Append
+          "Installer signer: $($signature.SignerCertificate.Subject)" |
+            Tee-Object -FilePath $installLog -Append
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+              $signature.SignerCertificate.Subject -notmatch 'NVIDIA') {
+            throw "The CUDA installer does not have a valid NVIDIA Authenticode signature."
+          }
+
+          # These are the components used by the existing CMake/Ninja CUDA build:
+          # nvcc, CUDA runtime/headers, cuBLAS runtime/development files, and
+          # Thrust/CUB headers. Display.Driver is deliberately not requested.
+          $arguments = @(
+            "-s",
+            "-n",
+            "nvcc_13.1",
+            "cudart_13.1",
+            "cublas_13.1",
+            "cublas_dev_13.1",
+            "thrust_13.1"
+          )
+          "Installing components: $($arguments[2..($arguments.Count - 1)] -join ', ')" |
+            Tee-Object -FilePath $installLog -Append
+          $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+          "CUDA installer exit code: $($process.ExitCode)" |
+            Tee-Object -FilePath $installLog -Append
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "CUDA installer failed with exit code $($process.ExitCode)."
+          }
+
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1"
+          $cudaBin = Join-Path $cudaRoot "bin"
+          $requiredFiles = @(
+            (Join-Path $cudaBin "nvcc.exe"),
+            (Join-Path $cudaRoot "include\cuda_runtime.h"),
+            (Join-Path $cudaRoot "include\cublas_v2.h"),
+            (Join-Path $cudaRoot "lib\x64\cudart_static.lib"),
+            (Join-Path $cudaRoot "lib\x64\cublas.lib"),
+            (Join-Path $cudaRoot "lib\x64\cuda.lib")
+          )
+          foreach ($requiredFile in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+              throw "Required CUDA file was not installed: $requiredFile"
+            }
+          }
+          $cubHeader = @(
+            (Join-Path $cudaRoot "include\cub\cub.cuh"),
+            (Join-Path $cudaRoot "include\cccl\cub\cub.cuh")
+          ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $cubHeader) {
+            throw "The CUDA Thrust/CUB headers were not installed."
+          }
+
+          "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $cudaBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:CUDA_PATH = $cudaRoot
+          $env:PATH = "$cudaBin;$env:PATH"
+          "CUDA root: $cudaRoot" | Tee-Object -FilePath $installLog -Append
+          & nvcc --version 2>&1 | Tee-Object -FilePath $installLog -Append
+          if ($LASTEXITCODE -ne 0) { throw "nvcc --version failed." }
+
+      - name: 安装项目依赖
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $log = Join-Path $env:BUILD_LOG_DIR "npm-deps-install.log"
+          & npm.cmd run deps:install 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) {
+            throw "npm run deps:install failed with exit code $LASTEXITCODE."
+          }
+
+      - name: 构建 CPU/CUDA Worker、Python 后端和 NSIS 安装包
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $log = Join-Path $env:BUILD_LOG_DIR "npm-build.log"
+          & npm.cmd run build 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) {
+            throw "npm run build failed with exit code $LASTEXITCODE."
+          }
+
+      - name: 验证安装包并生成 SHA-256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $distRoot = Join-Path $env:GITHUB_WORKSPACE "desktop\dist"
+          $installers = @(Get-ChildItem -LiteralPath $distRoot `
+            -Filter "AI-Jarvis-Setup-*-x64.exe" -File -ErrorAction SilentlyContinue)
+          if ($installers.Count -eq 0) {
+            throw "No installer matched desktop/dist/AI-Jarvis-Setup-*-x64.exe."
+          }
+
+          $checksumPath = Join-Path $distRoot "SHA256SUMS.txt"
+          $checksumLines = foreach ($installer in $installers) {
+            $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $sizeMiB = [Math]::Round($installer.Length / 1MB, 2)
+            Write-Host "Installer: $($installer.Name)"
+            Write-Host "Size: $($installer.Length) bytes ($sizeMiB MiB)"
+            Write-Host "SHA-256: $hash"
+            "$hash *$($installer.Name)"
+          }
+          [IO.File]::WriteAllLines($checksumPath, $checksumLines, [Text.UTF8Encoding]::new($false))
+          Write-Host "Checksum file: $checksumPath"
+
+      - name: 上传 Windows 安装包 Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer-${{ env.ARTIFACT_BRANCH }}-${{ github.run_number }}
+          path: |
+            desktop/dist/AI-Jarvis-Setup-*-x64.exe
+            desktop/dist/SHA256SUMS.txt
+            ${{ runner.temp }}/jarvis-build-logs/*.log
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: 收集失败诊断日志
+        if: failure()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Path $env:BUILD_LOG_DIR -Force | Out-Null
+
+          $diagnosticFiles = @(
+            "$env:GITHUB_WORKSPACE\build\release\native-cpu\CMakeFiles\CMakeConfigureLog.yaml",
+            "$env:GITHUB_WORKSPACE\build\release\native-cpu\CMakeFiles\CMakeError.log",
+            "$env:GITHUB_WORKSPACE\build\release\native-cpu\CMakeFiles\CMakeOutput.log",
+            "$env:GITHUB_WORKSPACE\build\release\native-cuda-13.3\CMakeFiles\CMakeConfigureLog.yaml",
+            "$env:GITHUB_WORKSPACE\build\release\native-cuda-13.3\CMakeFiles\CMakeError.log",
+            "$env:GITHUB_WORKSPACE\build\release\native-cuda-13.3\CMakeFiles\CMakeOutput.log"
+          )
+          foreach ($file in $diagnosticFiles) {
+            if (Test-Path -LiteralPath $file -PathType Leaf) {
+              $parentName = Split-Path (Split-Path $file -Parent) -Leaf
+              $destination = Join-Path $env:BUILD_LOG_DIR "$parentName-$(Split-Path $file -Leaf)"
+              Copy-Item -LiteralPath $file -Destination $destination -Force
+            }
+          }
+
+          $npmLogRoot = Join-Path $env:LOCALAPPDATA "npm-cache\_logs"
+          if (Test-Path -LiteralPath $npmLogRoot -PathType Container) {
+            Get-ChildItem -LiteralPath $npmLogRoot -Filter "*.log" -File -ErrorAction SilentlyContinue |
+              Copy-Item -Destination $env:BUILD_LOG_DIR -Force
+          }
+          exit 0
+
+      - name: 上传失败日志 Artifact
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer-${{ env.ARTIFACT_BRANCH }}-${{ github.run_number }}-failure-logs
+          path: ${{ runner.temp }}/jarvis-build-logs/**/*
+          retention-days: 7
+          if-no-files-found: ignore
