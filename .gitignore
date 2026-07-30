@@ -26,7 +26,7 @@ desktop/qa-output/
 
 # Local AI Jarvis runtime data and secrets
 config/local.toml
-models/
+/models/
 .runtime/
 /memory/
 /courses/
