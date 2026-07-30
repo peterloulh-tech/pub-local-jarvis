@@ -91,55 +91,16 @@ jobs:
             throw "VsDevCmd.bat was not found: $devCommand"
           }
 
-          $devEnvironment = & cmd.exe /d /s /c "`"$devCommand`" -no_logo -arch=x64 -host_arch=x64 >nul && set"
-          if ($LASTEXITCODE -ne 0) {
-            throw "VsDevCmd.bat failed with exit code $LASTEXITCODE."
-          }
-
-          $persistVariables = @(
-            "DevEnvDir",
-            "INCLUDE",
-            "LIB",
-            "LIBPATH",
-            "UCRTVersion",
-            "UniversalCRTSdkDir",
-            "VCINSTALLDIR",
-            "VCToolsInstallDir",
-            "VisualStudioVersion",
-            "VSINSTALLDIR",
-            "WindowsSdkBinPath",
-            "WindowsSdkDir",
-            "WindowsSDKVersion"
-          )
-          $protectedVariables = @(
-            "PSModulePath",
-            "HOME",
-            "USERPROFILE",
-            "TEMP",
-            "TMP",
-            "SystemRoot",
-            "ComSpec"
-          )
-          foreach ($line in $devEnvironment) {
-            $separator = $line.IndexOf('=')
-            if ($separator -le 0) { continue }
-            $name = $line.Substring(0, $separator)
-            $value = $line.Substring($separator + 1)
-            if ($protectedVariables -contains $name) {
-              continue
-            } elseif ($name -ieq "PATH") {
-              $value.Split(';', [StringSplitOptions]::RemoveEmptyEntries) |
-                ForEach-Object { $_ | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append }
-            } elseif ($persistVariables -contains $name) {
-              "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            }
-          }
           $env:PSModulePath = $effectivePSModulePath
           "WINDOWS_POWERSHELL_MODULE_PATH=$windowsPowerShellModulePath" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           "Visual Studio installation: $installationPath" |
             Tee-Object -FilePath (Join-Path $env:BUILD_LOG_DIR "tool-versions.log")
+          # Validate MSVC inside an isolated developer shell. Do not persist the
+          # VsDevCmd environment: prepare-release.ps1 initializes it once for the
+          # CUDA/Ninja build, and initializing an already-expanded environment can
+          # exceed cmd.exe's environment-line limit.
           & cmd.exe /d /s /c "`"$devCommand`" -no_logo -arch=x64 -host_arch=x64 >nul && cl.exe 2>&1" |
             Tee-Object -FilePath (Join-Path $env:BUILD_LOG_DIR "tool-versions.log") -Append
           if ($LASTEXITCODE -ne 0) {
