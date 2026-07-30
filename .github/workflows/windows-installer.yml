@@ -18,17 +18,20 @@ jobs:
     env:
       CUDA_VERSION: 13.1.1
       CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1
-      BUILD_LOG_DIR: ${{ runner.temp }}\jarvis-build-logs
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v7
 
-      - name: 准备构建日志目录
+      - name: 准备构建临时目录
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Path $env:BUILD_LOG_DIR -Force | Out-Null
+          $buildLogDir = Join-Path $env:RUNNER_TEMP "jarvis-build-logs"
+          $cudaInstallerPath = Join-Path $env:RUNNER_TEMP "cuda_$($env:CUDA_VERSION)_windows_network.exe"
+          New-Item -ItemType Directory -Path $buildLogDir -Force | Out-Null
+          "BUILD_LOG_DIR=$buildLogDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_INSTALLER_PATH=$cudaInstallerPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $artifactBranch = "${{ github.ref_name }}" -replace '[^A-Za-z0-9._-]', '-'
           "ARTIFACT_BRANCH=$artifactBranch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -129,7 +132,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
-          $installer = Join-Path $env:RUNNER_TEMP "cuda_13.1.1_windows_network.exe"
+          $installer = $env:CUDA_INSTALLER_PATH
           $installerUrl = "https://developer.download.nvidia.com/compute/cuda/13.1.1/network_installers/cuda_13.1.1_windows_network.exe"
           $installLog = Join-Path $env:BUILD_LOG_DIR "cuda-install.log"
 
@@ -260,6 +263,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+          if ([string]::IsNullOrWhiteSpace($env:BUILD_LOG_DIR)) {
+            $env:BUILD_LOG_DIR = Join-Path $env:RUNNER_TEMP "jarvis-build-logs"
+          }
           New-Item -ItemType Directory -Path $env:BUILD_LOG_DIR -Force | Out-Null
 
           $diagnosticFiles = @(
