@@ -51,6 +51,22 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $originalPSModulePath = $env:PSModulePath
+          if ([string]::IsNullOrWhiteSpace($originalPSModulePath)) {
+            throw "PSModulePath was empty before Visual Studio environment initialization."
+          }
+          $windowsPowerShellModuleRoot = Join-Path `
+            ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) `
+            "WindowsPowerShell\v1.0\Modules"
+          if (-not (Test-Path -LiteralPath $windowsPowerShellModuleRoot -PathType Container)) {
+            throw "Windows PowerShell system module directory was not found: $windowsPowerShellModuleRoot"
+          }
+          $modulePaths = @($originalPSModulePath.Split(';', [StringSplitOptions]::RemoveEmptyEntries))
+          if (-not ($modulePaths | Where-Object { $_.TrimEnd('\') -ieq $windowsPowerShellModuleRoot.TrimEnd('\') })) {
+            $modulePaths += $windowsPowerShellModuleRoot
+          }
+          $effectivePSModulePath = $modulePaths -join ';'
+          $env:PSModulePath = $effectivePSModulePath
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
           if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
             throw "vswhere.exe was not found: $vswhere"
@@ -88,18 +104,31 @@ jobs:
             "WindowsSdkDir",
             "WindowsSDKVersion"
           )
+          $protectedVariables = @(
+            "PSModulePath",
+            "HOME",
+            "USERPROFILE",
+            "TEMP",
+            "TMP",
+            "SystemRoot",
+            "ComSpec"
+          )
           foreach ($line in $devEnvironment) {
             $separator = $line.IndexOf('=')
             if ($separator -le 0) { continue }
             $name = $line.Substring(0, $separator)
             $value = $line.Substring($separator + 1)
-            if ($name -ieq "PATH") {
+            if ($protectedVariables -contains $name) {
+              continue
+            } elseif ($name -ieq "PATH") {
               $value.Split(';', [StringSplitOptions]::RemoveEmptyEntries) |
                 ForEach-Object { $_ | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append }
             } elseif ($persistVariables -contains $name) {
               "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             }
           }
+          $env:PSModulePath = $effectivePSModulePath
+          "PSModulePath=$effectivePSModulePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           "Visual Studio installation: $installationPath" |
             Tee-Object -FilePath (Join-Path $env:BUILD_LOG_DIR "tool-versions.log")
@@ -211,6 +240,64 @@ jobs:
           & npm.cmd run deps:install 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) {
             throw "npm run deps:install failed with exit code $LASTEXITCODE."
+          }
+
+      - name: 预检 Windows PowerShell 标准模块
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $log = Join-Path $env:BUILD_LOG_DIR "windows-powershell-preflight.log"
+          $windowsPowerShell = (Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
+          "Workflow shell: pwsh $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))" |
+            Tee-Object -FilePath $log
+          "Resolved powershell.exe: $windowsPowerShell" | Tee-Object -FilePath $log -Append
+
+          $preflight = @'
+          $ErrorActionPreference = "Stop"
+          try {
+              [Console]::OutputEncoding = [Text.Encoding]::UTF8
+              $OutputEncoding = [Text.Encoding]::UTF8
+              Write-Output ("PowerShell executable: " + (Get-Process -Id $PID).Path)
+              Write-Output ("PowerShell version: " + $PSVersionTable.PSVersion.ToString())
+              Write-Output ("PowerShell edition: " + $PSVersionTable.PSEdition)
+              Write-Output ("PSHOME: " + $PSHOME)
+              Write-Output ("PSModulePath: " + $env:PSModulePath)
+              if ($PSVersionTable.PSEdition -ne "Desktop" -or $PSVersionTable.PSVersion.Major -ne 5) {
+                  throw "powershell.exe did not start Windows PowerShell 5.1."
+              }
+
+              $utilityModules = @(Get-Module -ListAvailable -Name Microsoft.PowerShell.Utility)
+              if ($utilityModules.Count -eq 0) {
+                  throw "Microsoft.PowerShell.Utility is not discoverable through PSModulePath."
+              }
+              Write-Output "Discovered Microsoft.PowerShell.Utility modules:"
+              $utilityModules |
+                  Select-Object Name, Version, ModuleBase |
+                  Format-Table -AutoSize |
+                  Out-String |
+                  Write-Output
+
+              Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+              $fileHashCommand = Get-Command Get-FileHash -ErrorAction Stop
+              Write-Output "Resolved Get-FileHash command:"
+              $fileHashCommand |
+                  Select-Object Name, CommandType, Source, Version, Definition |
+                  Format-List |
+                  Out-String |
+                  Write-Output
+              exit 0
+          } catch {
+              [Console]::Error.WriteLine("Windows PowerShell module preflight failed: " + $_.Exception.Message)
+              [Console]::Error.WriteLine($_ | Out-String)
+              exit 1
+          }
+          '@
+
+          & $windowsPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command $preflight 2>&1 |
+            Tee-Object -FilePath $log -Append
+          $preflightExitCode = $LASTEXITCODE
+          if ($preflightExitCode -ne 0) {
+            throw "Windows PowerShell module preflight failed with exit code $preflightExitCode."
           }
 
       - name: 构建 CPU/CUDA Worker、Python 后端和 NSIS 安装包
