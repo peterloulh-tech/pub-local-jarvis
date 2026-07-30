@@ -67,6 +67,13 @@ jobs:
           }
           $effectivePSModulePath = $modulePaths -join ';'
           $env:PSModulePath = $effectivePSModulePath
+          $windowsPowerShellModulePath = $env:WinPSModulePath
+          if ([string]::IsNullOrWhiteSpace($windowsPowerShellModulePath)) {
+            $windowsPowerShellModulePath = (& powershell.exe -NoLogo -NoProfile -Command '$env:PSModulePath').Trim()
+          }
+          if ([string]::IsNullOrWhiteSpace($windowsPowerShellModulePath)) {
+            throw "The Windows PowerShell module path could not be determined."
+          }
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
           if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
             throw "vswhere.exe was not found: $vswhere"
@@ -128,7 +135,8 @@ jobs:
             }
           }
           $env:PSModulePath = $effectivePSModulePath
-          "PSModulePath=$effectivePSModulePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WINDOWS_POWERSHELL_MODULE_PATH=$windowsPowerShellModulePath" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           "Visual Studio installation: $installationPath" |
             Tee-Object -FilePath (Join-Path $env:BUILD_LOG_DIR "tool-versions.log")
@@ -293,6 +301,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
+          Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_POWERSHELL_MODULE_PATH)) {
+            throw "WINDOWS_POWERSHELL_MODULE_PATH was not initialized."
+          }
+          $env:PSModulePath = $env:WINDOWS_POWERSHELL_MODULE_PATH
           $log = Join-Path $env:BUILD_LOG_DIR "node-powershell-preflight.log"
           $nodeScriptPath = Join-Path $env:RUNNER_TEMP "jarvis-node-powershell-preflight.js"
           $powerShellScriptPath = Join-Path $env:RUNNER_TEMP "jarvis-node-child-preflight.ps1"
@@ -394,6 +408,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
+          Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_POWERSHELL_MODULE_PATH)) {
+            throw "WINDOWS_POWERSHELL_MODULE_PATH was not initialized."
+          }
+          $env:PSModulePath = $env:WINDOWS_POWERSHELL_MODULE_PATH
           $log = Join-Path $env:BUILD_LOG_DIR "npm-build.log"
           & npm.cmd run build 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) {
