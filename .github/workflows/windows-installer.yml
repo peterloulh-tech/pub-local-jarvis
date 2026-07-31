@@ -18,6 +18,8 @@ jobs:
     env:
       CUDA_VERSION: 13.1.1
       CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1
+      CUDA_CRT_VERSION: 13.1.115
+      CUDA_CRT_SHA256: 70ceb7b7c5ef29fab700000fd0b127b7ffd4c8a78eac413ed2c39eb94437580c
 
     steps:
       - name: 检出代码
@@ -171,9 +173,41 @@ jobs:
 
           $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1"
           $cudaBin = Join-Path $cudaRoot "bin"
+          # CUDA 13.1 publishes the compiler-runtime headers as a separate,
+          # checksum-addressed redistributable. The selective network-installer
+          # components do not provide include\crt on the hosted runner.
+          $cudaCrtArchive = Join-Path $env:RUNNER_TEMP `
+            "cuda_crt-windows-x86_64-$($env:CUDA_CRT_VERSION)-archive.zip"
+          $cudaCrtExtractRoot = Join-Path $env:RUNNER_TEMP "jarvis-cuda-crt"
+          $cudaCrtUrl = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-$($env:CUDA_CRT_VERSION)-archive.zip"
+          "Downloading CUDA CRT headers from $cudaCrtUrl" |
+            Tee-Object -FilePath $installLog -Append
+          Invoke-WebRequest -Uri $cudaCrtUrl -OutFile $cudaCrtArchive -UseBasicParsing
+          $cudaCrtHash = (Get-FileHash -LiteralPath $cudaCrtArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "CUDA CRT archive SHA-256: $cudaCrtHash" |
+            Tee-Object -FilePath $installLog -Append
+          if ($cudaCrtHash -ne $env:CUDA_CRT_SHA256) {
+            throw "CUDA CRT archive SHA-256 did not match the pinned value."
+          }
+          if (Test-Path -LiteralPath $cudaCrtExtractRoot) {
+            Remove-Item -LiteralPath $cudaCrtExtractRoot -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $cudaCrtArchive -DestinationPath $cudaCrtExtractRoot
+          $cudaCrtSource = Join-Path $cudaCrtExtractRoot `
+            "cuda_crt-windows-x86_64-$($env:CUDA_CRT_VERSION)-archive\include\crt"
+          if (-not (Test-Path -LiteralPath (Join-Path $cudaCrtSource "host_config.h") -PathType Leaf)) {
+            throw "The pinned CUDA CRT archive did not contain include\crt\host_config.h."
+          }
+          $cudaCrtDestination = Join-Path $cudaRoot "include\crt"
+          New-Item -ItemType Directory -Path $cudaCrtDestination -Force | Out-Null
+          Get-ChildItem -LiteralPath $cudaCrtSource -File |
+            Copy-Item -Destination $cudaCrtDestination -Force
+
           $requiredFiles = @(
             (Join-Path $cudaBin "nvcc.exe"),
             (Join-Path $cudaRoot "include\cuda_runtime.h"),
+            (Join-Path $cudaRoot "include\crt\host_config.h"),
+            (Join-Path $cudaRoot "include\crt\host_defines.h"),
             (Join-Path $cudaRoot "include\cublas_v2.h"),
             (Join-Path $cudaRoot "lib\x64\cudart_static.lib"),
             (Join-Path $cudaRoot "lib\x64\cublas.lib"),
@@ -199,6 +233,47 @@ jobs:
           "CUDA root: $cudaRoot" | Tee-Object -FilePath $installLog -Append
           & nvcc --version 2>&1 | Tee-Object -FilePath $installLog -Append
           if ($LASTEXITCODE -ne 0) { throw "nvcc --version failed." }
+
+          # Compile, but do not run, a minimal CUDA translation unit before the
+          # expensive CPU build. This validates NVCC, CUDA CRT headers and MSVC.
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $installationPath = (& $vswhere -latest -products * -version '[17.0,18.0)' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath | Select-Object -First 1).Trim()
+          $devCommand = Join-Path $installationPath "Common7\Tools\VsDevCmd.bat"
+          $cudaSmokeSource = Join-Path $env:RUNNER_TEMP "jarvis-cuda-toolchain-smoke.cu"
+          $cudaSmokeObject = Join-Path $env:RUNNER_TEMP "jarvis-cuda-toolchain-smoke.obj"
+          $cudaSmokeBatch = Join-Path $env:RUNNER_TEMP "jarvis-cuda-toolchain-smoke.cmd"
+          [IO.File]::WriteAllText(
+            $cudaSmokeSource,
+            'extern "C" __global__ void jarvis_cuda_toolchain_smoke() {}',
+            [Text.Encoding]::ASCII
+          )
+          [IO.File]::WriteAllLines(
+            $cudaSmokeBatch,
+            @(
+              '@echo off',
+              "call `"$devCommand`" -no_logo -arch=x64 -host_arch=x64 >nul",
+              'if errorlevel 1 exit /b %errorlevel%',
+              "`"$(Join-Path $cudaBin 'nvcc.exe')`" -allow-unsupported-compiler -arch=sm_75 -c `"$cudaSmokeSource`" -o `"$cudaSmokeObject`"",
+              'exit /b %errorlevel%'
+            ),
+            [Text.Encoding]::ASCII
+          )
+          $cudaSmokeExitCode = 1
+          try {
+            & $cudaSmokeBatch 2>&1 |
+              Tee-Object -FilePath $installLog -Append
+            $cudaSmokeExitCode = $LASTEXITCODE
+          } finally {
+            Remove-Item -LiteralPath $cudaSmokeSource, $cudaSmokeObject, $cudaSmokeBatch `
+              -Force -ErrorAction SilentlyContinue
+          }
+          if ($cudaSmokeExitCode -ne 0) {
+            throw "CUDA compiler preflight failed with exit code $cudaSmokeExitCode."
+          }
+          "CUDA compiler preflight passed without executing GPU code." |
+            Tee-Object -FilePath $installLog -Append
 
       - name: 安装项目依赖
         working-directory: desktop
@@ -386,6 +461,38 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $distRoot = Join-Path $env:GITHUB_WORKSPACE "desktop\dist"
+          $packagedRuntimeRoot = Join-Path $distRoot "win-unpacked\resources\backend\runtime"
+          $packagedLicenseRoot = Join-Path $distRoot "win-unpacked\resources\licenses"
+          $requiredPackagedFiles = @(
+            (Join-Path $packagedRuntimeRoot "jarvis-launcher.exe"),
+            (Join-Path $packagedRuntimeRoot "jarvis-native-worker-cpu.exe"),
+            (Join-Path $packagedRuntimeRoot "jarvis-native-worker-cuda.exe"),
+            (Join-Path $packagedRuntimeRoot "runtime-manifest.json"),
+            (Join-Path $packagedRuntimeRoot "default_ref_audio.wav"),
+            (Join-Path $packagedLicenseRoot "AI-Jarvis-LICENSE.txt"),
+            (Join-Path $packagedLicenseRoot "THIRD_PARTY_NOTICES.md")
+          )
+          foreach ($requiredPackagedFile in $requiredPackagedFiles) {
+            if (-not (Test-Path -LiteralPath $requiredPackagedFile -PathType Leaf)) {
+              throw "Packaged runtime file is missing: $requiredPackagedFile"
+            }
+          }
+          foreach ($cudaRuntimePattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+            if (-not (Get-ChildItem -LiteralPath $packagedRuntimeRoot `
+                -Filter $cudaRuntimePattern -File -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+              throw "Packaged CUDA dependency is missing: $cudaRuntimePattern"
+            }
+          }
+          $runtimeManifest = Get-Content -LiteralPath `
+            (Join-Path $packagedRuntimeRoot "runtime-manifest.json") -Raw -Encoding UTF8 |
+            ConvertFrom-Json
+          if ($runtimeManifest.architecture -ne "x64" -or
+              $runtimeManifest.inference -notcontains "cpu" -or
+              $runtimeManifest.inference -notcontains "cuda") {
+            throw "Packaged runtime manifest does not declare x64 CPU and CUDA inference."
+          }
+          Write-Host "Packaged runtime, CUDA DLLs and legal notices are present."
+
           $installers = @(Get-ChildItem -LiteralPath $distRoot `
             -Filter "AI-Jarvis-Setup-*-x64.exe" -File -ErrorAction SilentlyContinue)
           if ($installers.Count -eq 0) {
@@ -426,18 +533,35 @@ jobs:
           New-Item -ItemType Directory -Path $env:BUILD_LOG_DIR -Force | Out-Null
 
           $diagnosticFiles = @(
-            "$env:GITHUB_WORKSPACE\build\release\native-cpu\CMakeFiles\CMakeConfigureLog.yaml",
-            "$env:GITHUB_WORKSPACE\build\release\native-cpu\CMakeFiles\CMakeError.log",
-            "$env:GITHUB_WORKSPACE\build\release\native-cpu\CMakeFiles\CMakeOutput.log",
-            "$env:GITHUB_WORKSPACE\build\release\native-cuda-13.3\CMakeFiles\CMakeConfigureLog.yaml",
-            "$env:GITHUB_WORKSPACE\build\release\native-cuda-13.3\CMakeFiles\CMakeError.log",
-            "$env:GITHUB_WORKSPACE\build\release\native-cuda-13.3\CMakeFiles\CMakeOutput.log"
+            @{
+              Source = "$env:GITHUB_WORKSPACE\build\release\native-cpu\CMakeFiles\CMakeConfigureLog.yaml"
+              Name = "native-cpu-CMakeConfigureLog.yaml"
+            },
+            @{
+              Source = "$env:GITHUB_WORKSPACE\build\release\native-cpu\CMakeFiles\CMakeError.log"
+              Name = "native-cpu-CMakeError.log"
+            },
+            @{
+              Source = "$env:GITHUB_WORKSPACE\build\release\native-cpu\CMakeFiles\CMakeOutput.log"
+              Name = "native-cpu-CMakeOutput.log"
+            },
+            @{
+              Source = "$env:GITHUB_WORKSPACE\build\release\native-cuda-13.3\CMakeFiles\CMakeConfigureLog.yaml"
+              Name = "native-cuda-CMakeConfigureLog.yaml"
+            },
+            @{
+              Source = "$env:GITHUB_WORKSPACE\build\release\native-cuda-13.3\CMakeFiles\CMakeError.log"
+              Name = "native-cuda-CMakeError.log"
+            },
+            @{
+              Source = "$env:GITHUB_WORKSPACE\build\release\native-cuda-13.3\CMakeFiles\CMakeOutput.log"
+              Name = "native-cuda-CMakeOutput.log"
+            }
           )
           foreach ($file in $diagnosticFiles) {
-            if (Test-Path -LiteralPath $file -PathType Leaf) {
-              $parentName = Split-Path (Split-Path $file -Parent) -Leaf
-              $destination = Join-Path $env:BUILD_LOG_DIR "$parentName-$(Split-Path $file -Leaf)"
-              Copy-Item -LiteralPath $file -Destination $destination -Force
+            if (Test-Path -LiteralPath $file.Source -PathType Leaf) {
+              $destination = Join-Path $env:BUILD_LOG_DIR $file.Name
+              Copy-Item -LiteralPath $file.Source -Destination $destination -Force
             }
           }
 
