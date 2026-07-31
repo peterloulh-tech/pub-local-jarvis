@@ -456,9 +456,9 @@ MiniCPM-o 4.5 当前已有代码基线；MiniCPM-V 4.0 和 V 4.6 属于未来适
 
 - 停止获取新画面和音频；
 - 停止生成新弹幕；
-- 保留已经加载的模型；
+- 保留 Electron 管理的 Backend、Worker 和已经加载的模型；
 - 保留恢复所需的安全状态；
-- 恢复时能够快速继续。
+- 恢复时沿现有 Backend/Worker 会话快速继续，不得退化为重新启动或重新加载模型。
 
 暂停期间如何处理已经进入 Queue 的弹幕尚待产品确认，实现前必须明确是保留、丢弃还是恢复后重新检查有效期，不得由单层代码自行决定。
 
@@ -473,6 +473,8 @@ MiniCPM-o 4.5 当前已有代码基线；MiniCPM-V 4.0 和 V 4.6 属于未来适
 - 释放 GPU VRAM；
 - 关闭或重置 Worker；
 - 恢复到程序刚打开、尚未启动模型的状态。
+
+当前 Electron 基础生命周期已经提供真正停止：仅对 Electron 自己启动并管理的 Backend 执行 `shutdown`、终止自有 Backend/Worker 进程树并关闭相关 WebSocket 连接。停止失败必须恢复操作前状态并显示明确错误，不得假装进入 `idle`；已连接但非 Electron 自有的 Backend 不得被擅自终止。Windows 真实进程树终止、模型资源与 GPU VRAM 释放仍待 Windows/NVIDIA 实机验证。
 
 ### 11.3 状态机
 

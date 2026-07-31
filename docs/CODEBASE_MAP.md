@@ -35,6 +35,7 @@ AI Jarvis 是一个主要面向 64 位 Windows 10/11 的本地多模态桌面助
 | 目录 | 模块职责 | 主要语言/框架 | 主要入口 |
 | --- | --- | --- | --- |
 | `desktop/` | Electron 桌面应用、窗口、托盘、桌宠、弹幕、设置、进程管理和安装包配置 | JavaScript、HTML、CSS、Electron | `desktop/src/main.js` |
+| `desktop/src/monitoring-control.js` | `pause`、`resume`、`stop` 的状态约束、pending 防重和失败回滚 | JavaScript、CommonJS | `createMonitoringControl()` |
 | `desktop/src/runtime-mode.js` | 运行模式归一化、启动前选择保留、弹幕/气泡显示策略、方案提示会话和致命故障窗口展示 | JavaScript、CommonJS | `runtime-mode.js` |
 | `desktop/src/ui/` | 控制面板、桌宠和弹幕 Renderer | HTML、CSS、JavaScript | `launcher.html`、`pet.html`、`barrage.html` |
 | `src/jarvis_backend/api/` | HTTP API、WebSocket 事件流、请求/响应模型和可选 Bearer Token | Python、FastAPI、Pydantic | `routes.py`、`ws.py` |
@@ -58,6 +59,7 @@ AI Jarvis 是一个主要面向 64 位 Windows 10/11 的本地多模态桌面助
 - `desktop/package.json` 的 `main` 指向 `desktop/src/main.js`。
 - `desktop/src/main.js` 创建控制面板、桌宠、弹幕和托盘，注册 IPC，并持有桌面端运行状态。
 - `desktop/src/preload.js` 通过 `contextBridge` 向 Renderer 暴露受限 API。
+- `desktop/src/monitoring-control.js` 约束暂停、恢复和停止的允许状态，以单一 `pendingAction` 阻止同类或交叉重复操作，并在失败时恢复操作前状态。
 - `desktop/src/runtime-mode.js` 提供 `normalizeRuntimeMode()`、`runtimeModeForRender()`、`shouldAcceptBarrage()`、`shouldShowAssistantBubble()`、一次性方案提示会话和 `revealFatalError()`；`desktop/test/runtime-mode.test.js` 覆盖这些纯策略。
 - `desktop/src/backend-manager.js` 负责启动、健康检查、HTTP 请求、WebSocket 重连和进程树停止。
 
@@ -145,14 +147,20 @@ launcher.html 选择 assistant/game
 - Python 仍执行证据验证和 `CourseSceneStabilizer`，同时保留 `observed_scene`；强制 `game` 下这些结果不再取消或拒绝合法弹幕。
 - Electron 仍显示真实 scene 状态，但强制 `game` 下 `setScene(other/course)` 不隐藏弹幕窗口。
 
-### 5.5 `scene`、`screen_idle` 和方案提示的控制位置
+### 5.5 Electron 运行生命周期
+
+- `monitoring-control.js` 只允许 `running → paused`、`paused → running` 以及 `running/paused → stopping → idle`，并在 pending 期间拒绝暂停、恢复和重复停止；`main.js` 同时拒绝新的启动请求。
+- 真正停止链路为：控制面板停止按钮 → preload `jarvis:stop` → `main.js` 生命周期控制 → `BackendManager.stop()` → 后端 `shutdown` 与 Electron 自有进程树终止、WebSocket 关闭 → `idle`。
+- 停止成功保留当前 `runtimeMode`；停止失败恢复操作前的 phase、monitoring 和 `runtimeMode`。已连接但不是 Electron 启动的 Backend 会被明确拒绝，不会被擅自终止或假报为 `idle`。
+
+### 5.6 `scene`、`screen_idle` 和方案提示的控制位置
 
 - `scene` 的 C++ 归一化和下一轮连续状态在 `native/src/worker.cpp`；Python 证据校验、稳定和弹幕分支在 `src/jarvis_backend/orchestrator/service.py`；Electron窗口决策在 `desktop/src/main.js` 与 `desktop/src/runtime-mode.js`。
 - `screen_idle` 检测仍由 C++ `ScreenIdleMonitor` 保留。`structured_perception_allowed()` 只在强制 `game` 下绕过静止画面对结构化感知的阻断；scheduler busy、单任务在途、`perception_pending` 和 latest-only 保护未移除。`assistant` 仍按原逻辑暂停结构化感知。
 - 方案同步由 Electron 启动流程先调用 `set_game_profile`。强制 `game` 仅在同步成功后，由一次性 runtime session 显示一次“已加载《方案名称》游戏方案”；scene切换、暂停和恢复不再触发该提示。
 - `worker.fatal` 会直接使 Electron 进入错误状态并主动显示、聚焦控制面板，不依赖普通气泡规则。
 
-### 5.6 原生采集边界
+### 5.7 原生采集边界
 
 - `native/src/windows/dxgi_capture.cpp` 通过硬编码窗口标题 `AI Jarvis Pet` 查找桌宠所在显示器；品牌改名时必须同步评估 Electron 窗口标题和原生捕获逻辑，不能只改展示名称。
 - DXGI 或 WASAPI 在采集线程内部启动失败时，当前主要写入 stderr 并退出线程，缺少可靠的上层状态回传；原始 START 请求可能已经返回成功。
@@ -240,7 +248,8 @@ marker 快速路径依赖上一次完整哈希校验结果；C++ 运行时还会
 
 ### 7.4 停止和异常
 
-- 暂停或停止 monitoring：停止采集、停止双工、清空最新帧/音频和近期感知。
+- 暂停 monitoring：停止采集和双工，但保留 Backend、Worker 与已加载模型，恢复不重新启动 Backend。
+- Electron 真正停止：对其自有 Backend 先请求 `shutdown`，再终止自有进程树并关闭 WebSocket；Python/Worker 随该进程链路结束。
 - Worker 停止：停止 scheduler、释放 simplex/duplex context、卸载模型。
 - CUDA 初始化失败：安装版 launcher 终止 CUDA Worker 并尝试 CPU Worker。
 - DXGI/WASAPI 启动失败：当前采集线程可能只写 stderr 后退出，缺少与 Electron 运行状态一致的可靠失败回传。

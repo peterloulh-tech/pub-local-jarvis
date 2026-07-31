@@ -51,9 +51,12 @@
 | Windows 安装包工作流 | 已存在 | 用于生成 Windows 安装包；候选版仍需真实 Windows 安装和运行验证 |
 | Windows 验证工作流 `windows-validate.yml` | 已创建，待 GitHub 执行 | 计划运行 JavaScript、Python、Native 测试并编译正式 CPU/CUDA Native 目标，不生成安装包 |
 | `assistant` 与强制 `game` 的 `runtimeMode` | 代码已实现，待 GitHub Windows 验证 | 当前分支为 `feature-forced-game-mode`；已增加针对性测试，但尚不能据此宣称 Windows 采集、Named Pipe、CUDA 或真实游戏已验证 |
+| 基础运行生命周期控制 | 代码已实现，待 GitHub Windows 和 Windows/NVIDIA 实机验证 | 已实现暂停/恢复约束、pending 防重及 Electron 自有 Backend 的真正停止；真实进程树、Worker 和 GPU 资源释放仍须实机确认 |
 | 三种完整产品运行模式、模型管理、弹幕引擎 V2、高光、品牌和授权 | 未来工作 | 不得把下列工作包中的规划写成当前功能 |
 
 当前强制游戏模式进入候选版时，集中验证至少包括：默认 `assistant` 回归、`runtimeMode` 跨 Electron/Python/Named Pipe/C++ 传递、真实 `scene` 切换不终止游戏弹幕、`screen_idle` 不阻断强制游戏感知、暂停与恢复保留模式、方案提示每个运行周期只显示一次，以及 `worker.fatal` 能让用户看到明确错误界面。
+
+下一阶段为“恢复与诊断”，重点处理故障回传、Worker 异常恢复和运行诊断；需求规划中的后续架构优化不提前并入本阶段。
 
 ## 4. 工作包 0：开发基线
 
@@ -103,7 +106,7 @@
 - Windows 原生采集、Named Pipe、安装包和真实游戏基线：必须 Windows；
 - CUDA、VRAM 和模型性能基线：必须 NVIDIA。
 
-## 5. 工作包 1：稳定性修复
+## 5. 工作包 1：恢复与诊断
 
 ### 目标
 
@@ -166,6 +169,8 @@
 - 强制 `game` 中 `screen_idle` 不再阻断新的结构化感知，但原有单任务在途、防重和限流仍保留；
 - 强制 `game` 中桌宠主体持续隐藏，真实 `scene` 变化不隐藏弹幕窗口；`worker.fatal` 仍主动显示并聚焦控制面板；
 - 暂停与恢复保留本次 `runtimeMode`，方案成功提示按运行周期去重；
+- 基础生命周期只允许 `running` 暂停、`paused` 恢复，以及 `running/paused` 真正停止；pending 期间拒绝重复或交叉生命周期操作；
+- Electron 自有 Backend 停止成功后进入 `idle` 并保留 `runtimeMode`，停止失败或 Backend 非 Electron 自有时恢复原状态并显示错误；
 - 上述实现仍待 `windows-validate`、安装包候选版和真实 Windows/NVIDIA 游戏验证。
 
 当前强制 `game` 仍采集系统音频，并会建立现有 ambient Full-duplex 会话；它不等同于下述未来“专注游戏模式”。

@@ -87,6 +87,8 @@ config/default.toml
 - `desktop/src/ui/launcher.html`
 - `desktop/src/ui/launcher.js`
 - `desktop/src/preload.js`
+- `desktop/src/monitoring-control.js`
+- `desktop/src/backend-manager.js`
 - `desktop/src/runtime-mode.js`
 - `desktop/src/main.js`
 - `src/jarvis_backend/orchestrator/service.py`
@@ -144,6 +146,23 @@ game 启动周期
 - 同一启动 Promise 的重复调用、`scene` 变化、暂停和恢复不会再次显示。
 - 同步失败不显示成功提示。
 - 停止当前 AI 运行后再次点击启动，或关闭并重新打开应用后，新运行周期可以再次显示。
+
+### 暂停、恢复与真正停止
+
+```text
+控制面板停止按钮
+→ preload jarvis:stop
+→ main.js 生命周期控制
+→ BackendManager.stop()
+→ shutdown + Electron 自有 Backend/Worker 进程树 + WebSocket
+→ idle
+```
+
+- `running` 和 `paused` 允许停止，并立即进入 `stopping`；`idle`、`starting`、`stopping` 不允许停止。
+- `stopping` 期间禁止启动、暂停、恢复和重复停止，Backend 停止调用最多执行一次。
+- 停止成功进入 `idle`、清除 pending 与旧错误，并保留用户当前选择的 `runtimeMode`。
+- 停止失败恢复操作前状态和 `runtimeMode`，不得假装进入 `idle`；非 Electron 自有 Backend 会明确拒绝真正停止且不会被擅自终止。
+- 暂停仍保留 Backend、Worker 和模型，恢复沿现有命令继续运行，不重新启动或重新加载 Backend。
 
 ### 修改风险与验证
 
