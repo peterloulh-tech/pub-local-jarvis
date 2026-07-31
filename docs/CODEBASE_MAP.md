@@ -4,7 +4,7 @@
 
 ## 1. 项目定位
 
-AI Jarvis 是一个主要面向 64 位 Windows 10/11 的本地多模态桌面助手。它由 Electron 桌面端、Python/FastAPI 编排后端和 C++20 原生 Worker 组成，通过本地 MiniCPM-o 4.5 GGUF 模型理解屏幕画面和系统播放音频，并根据稳定场景显示桌宠消息、游戏弹幕或记录课程内容。
+AI Jarvis 是一个主要面向 64 位 Windows 10/11 的本地多模态桌面助手。它由 Electron 桌面端、Python/FastAPI 编排后端和 C++20 原生 Worker 组成，通过本地 MiniCPM-o 4.5 GGUF 模型理解屏幕画面和系统播放音频。当前分支新增了用户明确选择的 `assistant` 与强制 `game` 两值 `runtimeMode`：普通助手仍由稳定场景控制桌宠、弹幕和课程行为；强制游戏模式则持续执行游戏感知和弹幕链路，模型输出的场景只保留为识别与诊断信息。
 
 核心屏幕、音频和模型推理在本机完成。日程图生成功能是独立的可选联网能力，只有用户配置图像 API 并主动生成时才访问外部服务。
 
@@ -35,6 +35,7 @@ AI Jarvis 是一个主要面向 64 位 Windows 10/11 的本地多模态桌面助
 | 目录 | 模块职责 | 主要语言/框架 | 主要入口 |
 | --- | --- | --- | --- |
 | `desktop/` | Electron 桌面应用、窗口、托盘、桌宠、弹幕、设置、进程管理和安装包配置 | JavaScript、HTML、CSS、Electron | `desktop/src/main.js` |
+| `desktop/src/runtime-mode.js` | 运行模式归一化、启动前选择保留、弹幕/气泡显示策略、方案提示会话和致命故障窗口展示 | JavaScript、CommonJS | `runtime-mode.js` |
 | `desktop/src/ui/` | 控制面板、桌宠和弹幕 Renderer | HTML、CSS、JavaScript | `launcher.html`、`pet.html`、`barrage.html` |
 | `src/jarvis_backend/api/` | HTTP API、WebSocket 事件流、请求/响应模型和可选 Bearer Token | Python、FastAPI、Pydantic | `routes.py`、`ws.py` |
 | `src/jarvis_backend/orchestrator/` | 生命周期、事件总线、场景稳定、弹幕调度、课程和记忆编排 | Python、asyncio | `service.py` |
@@ -57,6 +58,7 @@ AI Jarvis 是一个主要面向 64 位 Windows 10/11 的本地多模态桌面助
 - `desktop/package.json` 的 `main` 指向 `desktop/src/main.js`。
 - `desktop/src/main.js` 创建控制面板、桌宠、弹幕和托盘，注册 IPC，并持有桌面端运行状态。
 - `desktop/src/preload.js` 通过 `contextBridge` 向 Renderer 暴露受限 API。
+- `desktop/src/runtime-mode.js` 提供 `normalizeRuntimeMode()`、`runtimeModeForRender()`、`shouldAcceptBarrage()`、`shouldShowAssistantBubble()`、一次性方案提示会话和 `revealFatalError()`；`desktop/test/runtime-mode.test.js` 覆盖这些纯策略。
 - `desktop/src/backend-manager.js` 负责启动、健康检查、HTTP 请求、WebSocket 重连和进程树停止。
 
 ### 4.2 Python 后端
@@ -120,9 +122,37 @@ C++ Native Worker
 
 - `EventBus` 保存有限历史并向 WebSocket 订阅者扇出事件。
 - Electron `event-router.js` 将后端 topic 转换为 scene、bubble、barrage、capture 或 fault effect。
-- Electron 主进程再次检查当前场景和隐私状态后才更新窗口。
+- Electron 主进程结合 `runtimeMode`、当前场景和隐私状态更新窗口：`assistant` 仍按场景显示，强制 `game` 不因 `other/course` 隐藏弹幕或丢弃 `barrage.generated`。
 
-### 5.4 原生采集边界
+### 5.4 `runtimeMode` 端到端链路与控制优先级
+
+```text
+launcher.html 选择 assistant/game
+→ launcher.js 保留未启动阶段的本地选择
+→ preload.js jarvis:start(runtimeMode)
+→ Electron main.js startJarvis(runtimeMode)
+→ POST /api/v1/commands start_monitoring {runtimeMode}
+→ OrchestrationService 保存 runtime_mode
+→ NamedPipeNativeClient 将参数编码为 START JSON payload
+→ named_pipe_server.cpp 解析 runtimeMode
+→ Worker::start_monitoring(..., RuntimeMode)
+```
+
+- `runtimeMode` 只由用户本次启动选择确定；未启动阶段的普通状态刷新不会把选择框强制改回主进程默认 `assistant`，`starting/running/paused` 才同步后端实际模式。
+- `pause_monitoring` 不清除 Python/Electron 保存的模式；`resume_monitoring` 重新把同一 `runtimeMode` 放入 START JSON。暂停和恢复不会创建新的方案提示会话。
+- `assistant` 是 Electron、Python、C++ 和非法/缺失 START 值的默认模式，保持原自动场景行为。
+- 强制 `game` 中，C++ 每轮使用低延迟游戏提示词并注入当前方案；真实 `scene` 仍输出，但不会改变 `runtimeMode`、清空合法候选或关闭游戏连续状态。
+- Python 仍执行证据验证和 `CourseSceneStabilizer`，同时保留 `observed_scene`；强制 `game` 下这些结果不再取消或拒绝合法弹幕。
+- Electron 仍显示真实 scene 状态，但强制 `game` 下 `setScene(other/course)` 不隐藏弹幕窗口。
+
+### 5.5 `scene`、`screen_idle` 和方案提示的控制位置
+
+- `scene` 的 C++ 归一化和下一轮连续状态在 `native/src/worker.cpp`；Python 证据校验、稳定和弹幕分支在 `src/jarvis_backend/orchestrator/service.py`；Electron窗口决策在 `desktop/src/main.js` 与 `desktop/src/runtime-mode.js`。
+- `screen_idle` 检测仍由 C++ `ScreenIdleMonitor` 保留。`structured_perception_allowed()` 只在强制 `game` 下绕过静止画面对结构化感知的阻断；scheduler busy、单任务在途、`perception_pending` 和 latest-only 保护未移除。`assistant` 仍按原逻辑暂停结构化感知。
+- 方案同步由 Electron 启动流程先调用 `set_game_profile`。强制 `game` 仅在同步成功后，由一次性 runtime session 显示一次“已加载《方案名称》游戏方案”；scene切换、暂停和恢复不再触发该提示。
+- `worker.fatal` 会直接使 Electron 进入错误状态并主动显示、聚焦控制面板，不依赖普通气泡规则。
+
+### 5.6 原生采集边界
 
 - `native/src/windows/dxgi_capture.cpp` 通过硬编码窗口标题 `AI Jarvis Pet` 查找桌宠所在显示器；品牌改名时必须同步评估 Electron 窗口标题和原生捕获逻辑，不能只改展示名称。
 - DXGI 或 WASAPI 在采集线程内部启动失败时，当前主要写入 stderr 并退出线程，缺少可靠的上层状态回传；原始 START 请求可能已经返回成功。
@@ -134,7 +164,7 @@ C++ Native Worker
 ```text
 用户启动 AI Jarvis.exe
 → Electron 创建控制面板、桌宠、弹幕和托盘
-→ 用户点击启动
+→ 用户选择 assistant 或 game 并点击启动
 → BackendManager 选择端口和唯一 Named Pipe
 → 启动冻结的 jarvis-launcher.exe
 → 选择 %LOCALAPPDATA%\AIJarvis 数据目录
@@ -146,7 +176,9 @@ C++ Native Worker
 → Python 连接 Pipe 并 ping Worker
 → Electron 健康检查和 WebSocket 连接成功
 → Electron 下发当前游戏方案
-→ Electron 下发 start_monitoring
+→ game 模式在 set_game_profile 成功后显示本运行周期唯一一次方案提示
+→ Electron 下发 start_monitoring {runtimeMode}
+→ Python 保存模式并通过 START JSON 传给 C++ Worker
 → Worker 创建采集线程后返回 START
 → DXGI/WASAPI 在线程内部初始化；Python 同时可能开始后台建立全双工上下文
 → 采集初始化与 duplex 建立可能并行；采集启动失败当前可能只写 stderr 并退出线程
@@ -237,6 +269,8 @@ npm test
 
 实际运行 `node --test test/*.test.js`。
 
+`desktop/test/runtime-mode.test.js` 专门覆盖运行模式默认值、未启动选择保留、game模式弹幕显示、普通气泡隔离、一次性方案提示和致命故障控制面板展示。
+
 可视化 smoke：
 
 ```bash
@@ -301,6 +335,8 @@ npm run verify:installer -- -FullStartup -RequireCuda
 | NSIS 安装、升级和卸载 | 不可验证 | 必须实测 | 必须实测 |
 
 Mac 可以用于代码阅读、静态分析，以及依赖已经存在时实际可运行的 JavaScript、Python 或其他跨平台轻量检查。DXGI、WASAPI、Named Pipe、CUDA fallback、Windows 安装包、透明置顶/点击穿透、全屏游戏和真实游戏运行都必须由 Windows 环境验证；CUDA 路径还需要 NVIDIA 实机。
+
+当前分支还包含 `.github/workflows/windows-validate.yml`：它在 `windows-2022` 上运行 Node/Python 测试与 Ruff，编译并运行 CPU Native 测试目标，再编译正式 CPU/CUDA Worker；该工作流不生成安装包。其结果只能作为云端编译和自动测试证据，不能替代真实 Windows/NVIDIA 安装、窗口、采集和游戏验证。
 
 ## 9. 文档维护规则
 

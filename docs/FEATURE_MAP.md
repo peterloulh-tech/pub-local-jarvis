@@ -80,7 +80,78 @@ config/default.toml
 - 可以在 Mac 测试 JSON 归一化、保存和加载逻辑。
 - `safeStorage`、真实 userData 路径、后端同步和重启恢复应在 Windows 验证。
 
-## 2. 游戏场景识别
+## 2. assistant 与强制 game 运行模式
+
+### 相关文件
+
+- `desktop/src/ui/launcher.html`
+- `desktop/src/ui/launcher.js`
+- `desktop/src/preload.js`
+- `desktop/src/runtime-mode.js`
+- `desktop/src/main.js`
+- `src/jarvis_backend/orchestrator/service.py`
+- `src/jarvis_backend/native/client.py`
+- `native/include/jarvis/worker.hpp`
+- `native/src/windows/named_pipe_server.cpp`
+- `native/src/worker.cpp`
+- `desktop/test/runtime-mode.test.js`
+- `tests/unit/test_control_plane_api.py`
+- `native/tests/native_tests.cpp`
+
+### 端到端数据流
+
+```text
+用户启动前选择 runtimeMode
+→ launcher.js 在未启动状态保留选择
+→ preload IPC
+→ Electron startJarvis(runtimeMode)
+→ HTTP start_monitoring {runtimeMode}
+→ Python OrchestrationService.runtime_mode
+→ Named Pipe START JSON
+→ runtime_mode_from_start_payload
+→ Worker::start_monitoring(..., RuntimeMode)
+```
+
+`runtimeMode` 不写入用户设置文件，只描述本次运行周期。`assistant` 是所有层的默认值；非法、缺失或无法解析的值都会回退到 `assistant`。暂停不会清除模式，恢复时 Python 把已保存的模式再次放入 START JSON。模型输出的 `scene` 不会写回或改变 `runtimeMode`。
+
+### 当前行为对照
+
+| 行为 | `assistant` | 强制 `game` |
+| --- | --- | --- |
+| 屏幕和系统音频采集 | 启动 monitoring 后持续采集 | 启动 monitoring 后持续采集 |
+| 结构化感知提示词 | 由 `previous_scene_` 选择统一、游戏连续或课程连续提示词 | 每轮固定使用低延迟游戏提示词，并追加强制游戏约束 |
+| 游戏方案注入 | 仅下一轮游戏连续状态注入 | 每轮注入当前方案名称和提示词 |
+| 模型 `scene` | 控制候选保留、Python业务分支和Electron窗口 | 只作为真实识别与诊断结果，不控制游戏链路 |
+| `screen_idle` | 阻断新的结构化感知，保留原提醒逻辑 | 继续按原正常节奏调度结构化感知，不移除并发保护 |
+| 弹幕候选 | 只有验证后的游戏场景保留 | `game/other/course` 都可保留合法候选 |
+| Python弹幕 | 稳定场景不是游戏时拒绝或取消 | 不因稳定场景或显示场景不是游戏而拒绝、取消 |
+| Electron弹幕窗口 | 按稳定scene显示或隐藏 | 本次运行期间不因scene变化隐藏或丢弃事件 |
+| 普通桌宠气泡 | 保留原行为 | 普通气泡被抑制；致命故障仍主动打开控制面板 |
+| ambient duplex | monitoring后按现有逻辑后台创建 | 当前代码同样会后台创建，但普通主动消息不显示为桌宠气泡 |
+
+强制 `game` 是当前已经实现、待 GitHub Windows 验证和真实 Windows/NVIDIA 实测的代码能力。它不等于产品规划中的“专注游戏模式/画面加音频游戏模式”已经全部完成：当前尚未提供关闭音频或关闭 ambient duplex 的独立产品模式，也没有模型能力兼容矩阵。
+
+### 方案提示生命周期
+
+```text
+game 启动周期
+→ set_game_profile 成功
+→ runtime session 尚未消费提示
+→ 显示一次“已加载《方案名称》游戏方案”
+```
+
+- `assistant` 不显示该提示。
+- 同一启动 Promise 的重复调用、`scene` 变化、暂停和恢复不会再次显示。
+- 同步失败不显示成功提示。
+- 停止当前 AI 运行后再次点击启动，或关闭并重新打开应用后，新运行周期可以再次显示。
+
+### 修改风险与验证
+
+- 风险：**高**，因为跨越Renderer、Electron主进程、HTTP、Python、Named Pipe和C++ Worker。
+- 纯策略、Python编排和Native解析已有针对性测试。
+- 当前仍需 `.github/workflows/windows-validate.yml` 验证 MSVC/Named Pipe/CUDA 正式目标，并需真实 Windows/NVIDIA 验证采集、全屏窗口、连续运行和游戏效果。
+
+## 3. 游戏场景识别
 
 ### 相关文件
 
@@ -123,6 +194,16 @@ C++ validated_scene_for_prompt
 
 `validated_scene_for_prompt` 只更新用于下一轮的 `previous_scene_`，不会直接改写本轮 `value["scene"]`；本轮最终展示场景由 Python 证据验证和场景稳定器确定。
 
+强制 `game` 的控制分支：
+
+```text
+模型真实 scene
+→ C++保留scene作为本轮结果，但把下一轮previous_scene_维持为game
+→ Python保留observed_scene并继续运行稳定器
+→ runtime_mode=game绕过候选清空、弹幕取消和显示场景门禁
+→ Electron记录scene但保持弹幕窗口可用
+```
+
 ### 当前规则
 
 - 场景值固定为 `game`、`course`、`other`。
@@ -133,6 +214,7 @@ C++ validated_scene_for_prompt
 - 前台窗口在一次推理期间切换时，C++ 丢弃旧结果并清理连续历史。
 - `SceneHysteresis` 和 `/scene/observations` 是兼容接口，不是当前真实多模态场景链路的主稳定器。
 - 课程录制结束另有 4 个样本和 90 秒 grace period，不等同于桌面显示场景。
+- 这些阈值和稳定器仍在强制 `game` 中产生诊断结果，但不再决定该运行周期是否继续游戏弹幕。
 
 ### 关键边界
 
@@ -148,7 +230,7 @@ C++ validated_scene_for_prompt
 - Python 稳定器和解析器可在 Mac 单测。
 - 识别准确率、多显示器、游戏视频与真实互动游戏必须在 Windows+真实模型验证；CUDA性能需 NVIDIA。
 
-## 3. 游戏方案
+## 4. 游戏方案
 
 ### 相关文件
 
@@ -171,9 +253,12 @@ C++ validated_scene_for_prompt
 → Named Pipe CONFIGURE_GAME
 → Worker::set_game_profile
 → 清空 recent_perceptions
-→ 已确认 game 的下一次低延迟感知注入 <game_profile>
+→ assistant 仅在下一轮游戏连续状态注入 <game_profile>
+→ 强制 game 每轮游戏提示词都注入 <game_profile>
 → 方案只控制称呼、语气、领域关注和表达方式
 ```
+
+启动提示是独立链路：Electron 在强制 `game` 启动时等待 `set_game_profile` 成功，再由本次 runtime session 显示一次方案加载提示；它不再绑定 `setScene("game")`。
 
 ### 当前数据结构
 
@@ -186,7 +271,7 @@ C++ validated_scene_for_prompt
 
 ### 关键边界
 
-- 方案只在 `previous_scene_ == "game"` 时注入。
+- `assistant` 中方案只在 `previous_scene_ == "game"` 时注入；强制 `game` 中每轮注入。
 - 方案数据块被标记为非指令事实，不得修改分类或补充画面事实。
 - 直接改变注入时机可能导致任意用户方案污染场景判断。
 
@@ -196,7 +281,7 @@ C++ validated_scene_for_prompt
 - 保存、升级和删除行为可在 Mac 单测。
 - 对弹幕风格和分类隔离的实际影响需 Windows+真实模型验证。
 
-## 4. 弹幕生成
+## 5. 弹幕生成
 
 ### 相关文件
 
@@ -210,7 +295,7 @@ C++ validated_scene_for_prompt
 ### 数据流
 
 ```text
-已确认或正在判断的游戏画面/音频
+当前画面/音频
 → 结构化感知提示词
 → observation + 最多 3 个 barrage_candidates
 → C++ JSON 完整/截断恢复
@@ -220,6 +305,8 @@ C++ validated_scene_for_prompt
 → 质量 penalty、近期精确重复和语义相似过滤
 → 排序后的可用候选
 ```
+
+在 `assistant` 中，只有校验后的游戏场景进入候选链路；在强制 `game` 中，提示词要求保留真实scene但始终生成游戏弹幕候选，C++和Python不会因为scene为`other/course`清空合法候选。
 
 ### 关键规则
 
@@ -235,7 +322,7 @@ C++ validated_scene_for_prompt
 - 解析、排序和去重可单测。
 - 内容正确性、延迟、方案服从度和幻觉必须在真实游戏、Windows 和模型环境验证。
 
-## 5. 弹幕调度和显示
+## 6. 弹幕调度和显示
 
 ### 相关文件
 
@@ -256,11 +343,12 @@ Python 可用候选
 → 第一条立即发布 barrage.generated
 → 其余候选每隔 game_barrage_interval_seconds 发布
 → 新的非空有效候选进入 _start_barrage_sequence 时取消旧 _barrage_task
-→ 离开 game 或停止 monitoring 取消未发送候选
+→ assistant离开game，或任一模式停止monitoring时取消未发送候选
 → EventBus
 → WebSocket
 → Electron event-router
-→ 仅当前 scene=game 且非隐私模式时转发
+→ assistant仅当前scene=game且非隐私模式时转发
+→ 强制 game 只检查非隐私模式，不用 `scene` 拒绝
 → 透明、置顶、点击穿透 barrage BrowserWindow
 → 5 条轨道选择最早可用轨道
 → 6 秒 CSS 动画
@@ -276,7 +364,7 @@ Python 可用候选
 - 弹幕轨道占用时间：1.5 秒。
 - 屏幕飞行动画：6 秒。
 - 自动候选序列只有一个任务；新的非空有效弹幕组会取消旧组的剩余发送任务，因此仍存在新有效弹幕组覆盖旧组剩余弹幕的问题。
-- 如果新一轮仍为 `game` 但没有有效候选，不会调用 `_start_barrage_sequence()`，旧弹幕序列可能继续发送。
+- 如果新一轮没有有效候选，不会调用 `_start_barrage_sequence()`；强制 `game` 中即使真实scene为`other/course`，旧弹幕序列也可能继续发送。
 
 ### 修改风险与验证
 
@@ -284,7 +372,7 @@ Python 可用候选
 - Python任务取消和顺序可在 Mac 单测。
 - 视觉密度、帧率、全屏置顶、点击穿透和反作弊兼容必须在 Windows 游戏实测。
 
-## 6. 桌宠
+## 7. 桌宠
 
 ### 相关文件
 
@@ -315,7 +403,7 @@ Python 可用候选
 - 无边框、透明、置顶、跨工作区、默认点击穿透。
 - 鼠标位于桌宠主体、气泡或聊天区时临时恢复交互。
 - 支持拖拽，并限制在当前显示器工作区。
-- `game` 场景隐藏桌宠主体，聊天展开时仍可显示。
+- `assistant` 中 `game` 场景隐藏桌宠主体；强制 `game` 中不论模型 `scene` 为何都隐藏桌宠主体，聊天展开时仍可显示。
 - 双击桌宠切换屏幕/音频感知隐私状态。
 - `Ctrl+M` 打开或关闭聊天框。
 
@@ -325,7 +413,7 @@ Python 可用候选
 - 窗口生命周期、DPI、多显示器、全屏置顶和点击穿透风险：**高**。
 - 纯函数可在 Mac 测试；窗口行为必须 Windows 实测。
 
-## 7. 主动对话
+## 8. 主动对话
 
 这里的“主动对话”包括用户通过 `Ctrl+M` 发起的桌宠聊天，以及模型主动决定 `LISTEN`/`SPEAK` 的持续感知消息；两者使用不同流程。
 
@@ -370,10 +458,12 @@ start_monitoring
 → Python 拼接碎片、过滤复述/提问/越权话术/重复
 → assistant.message
 → WebSocket
-→ 桌宠气泡，游戏场景下不显示普通气泡
+→ 桌宠气泡；`assistant` 的游戏场景及强制 `game` 运行模式不显示普通气泡
 ```
 
 当前 ambient instruction 主要负责普通场景中的视频/直播点评；桌面、游戏和课程由结构化感知处理。
+
+当前强制 `game` 并未关闭 ambient duplex：Python 在 monitoring 后仍会创建该上下文，但 Electron 抑制普通主动气泡。后续若实现产品规划中的“专注游戏模式”，必须另行增加不启动音频/duplex 的真实生命周期控制，不能把当前强制 `game` 误写成该功能已经存在。
 
 duplex 使用约 2 秒滚动音频窗口；结构化感知则按画面变化、音频活动、课程连续状态和 heartbeat 等条件触发，可累计更长的待感知音频，当前上限约 12 秒。两条路径不能按相同音频窗口理解。
 
@@ -384,7 +474,7 @@ duplex 使用约 2 秒滚动音频窗口；结构化感知则按画面变化、�
 - Python消息过滤和状态切换可单测。
 - 上下文显存、真实延迟、碎片输出和长时间稳定性需 Windows+真实模型验证；CUDA路径需 NVIDIA。
 
-## 8. 模型下载和加载
+## 9. 模型下载和加载
 
 ### 相关文件
 
@@ -438,7 +528,7 @@ launcher 选择 CUDA/CPU Worker
 - 下载器逻辑可在 Mac 使用 mock 测试。
 - 真实模型加载、Windows 原生采集、Named Pipe、CPU/CUDA fallback、显存和长时间运行不能由 Mac 测试证明，必须 Windows 实测；CUDA必须 NVIDIA。
 
-## 9. 日志
+## 10. 日志
 
 ### 相关文件
 
@@ -472,7 +562,7 @@ Electron 控制面只保留最近少量进度消息，不是持久日志系统�
 - 没有统一跨进程 correlation/session ID。
 - 没有日志轮转、大小上限或保留期。
 - Python业务事件和原生日志没有统一格式。
-- Worker崩溃后的诊断信息和用户可见错误存在断层。
+- Electron收到 `worker.fatal` 后会进入错误状态并主动显示、聚焦控制面板；但跨进程日志关联、崩溃原因归档和自动恢复仍未实现。
 
 ### 修改风险与验证
 
@@ -480,7 +570,7 @@ Electron 控制面只保留最近少量进度消息，不是持久日志系统�
 - 格式化和脱敏逻辑可跨平台测试。
 - 进程重定向、中文编码、安装目录权限和崩溃日志需 Windows 验证。
 
-## 10. Windows 安装包
+## 11. Windows 安装包
 
 ### 相关文件
 
@@ -489,6 +579,8 @@ Electron 控制面只保留最近少量进度消息，不是持久日志系统�
 - `desktop/scripts/prepare-release.ps1`
 - `desktop/scripts/resource-fallback.js`
 - `desktop/scripts/verify-installer.ps1`
+- `.github/workflows/windows-installer.yml`
+- `.github/workflows/windows-validate.yml`
 - `src/jarvis_backend/packaged_launcher.py`
 - `LICENSE`
 - `THIRD_PARTY_NOTICES.md`
@@ -525,6 +617,11 @@ verify:installer
 → 成功后静默卸载和清理临时目录
 ```
 
+GitHub Actions分为两条用途不同的链路：
+
+- `windows-installer.yml` 构建CPU/CUDA Worker、Python后端和NSIS安装包并上传EXE。
+- `windows-validate.yml` 运行JavaScript/Python/Ruff、CPU Native测试，并编译正式CPU/CUDA Worker；它不生成安装包。当前强制游戏模式尚待该工作流实际运行验证。
+
 ### 许可证边界
 
 - 项目源码使用 MIT LICENSE。
@@ -538,7 +635,7 @@ verify:installer
 - NSIS、冻结运行时、升级/卸载、CPU fallback 必须 Windows 验证。
 - CUDA Worker、DLL完整性和 `RequireCuda` 必须 NVIDIA 实机验证。
 
-## 11. 未来授权激活
+## 12. 未来授权激活
 
 ### 当前状态
 
