@@ -21,6 +21,25 @@
 #endif
 
 namespace jarvis {
+RuntimeMode runtime_mode_from_string(std::string_view value) noexcept {
+  return value == "game" ? RuntimeMode::game : RuntimeMode::assistant;
+}
+
+RuntimeMode runtime_mode_from_start_payload(std::string_view payload) noexcept {
+  if (payload.empty()) return RuntimeMode::assistant;
+  try {
+    const auto arguments = nlohmann::json::parse(payload);
+    if (!arguments.is_object()) return RuntimeMode::assistant;
+    return runtime_mode_from_string(arguments.value("runtimeMode", "assistant"));
+  } catch (...) {
+    return RuntimeMode::assistant;
+  }
+}
+
+bool structured_perception_allowed(RuntimeMode runtime_mode, bool screen_idle) noexcept {
+  return runtime_mode == RuntimeMode::game || !screen_idle;
+}
+
 namespace {
 constexpr auto kPerceptionInterval = std::chrono::seconds(1);
 constexpr auto kAudiblePerceptionInterval = std::chrono::seconds(9);
@@ -476,6 +495,9 @@ observation 用 24 至 60 个汉字记录至少两个当前可见锚点，只写
 
 返回前检查固定字段完整、场景字段互斥、内容均可由 observation 支撑、JSON 类型与转义正确。)";
 
+constexpr std::string_view kForcedGameRuntimePrompt = R"(
+本次运行由用户明确选择“强制游戏弹幕模式”。scene 必须继续按当前画面如实输出 game、course 或 other，仅用于识别结果和诊断，不得据此退出本模式。无论 scene 为何，都基于本轮 observation 输出恰好 3 条非空、各不超过 30 字的 barrage_candidates；不得把旧画面、陪伴方案或虚构内容当作当前事实。course 和 assistant 内容字段保持为空。)";
+
 constexpr std::string_view kCourseContinuityPrompt = R"(
 上一轮已确认 course，但当前证据仍优先。若本轮仍是 course，最近转写只用于识别新增讲解和延续标题；短暂停顿、课件转场或讲师未出镜不等于离课。course_note 与 course_interaction 只使用本轮新增知识，不重复最近内容。)";
 
@@ -517,6 +539,7 @@ bool Worker::start(const std::string& model_path) {
               value = std::move(*recovered);
             }
             if (value.is_object()) {
+              const bool forced_game = runtime_mode_ == RuntimeMode::game;
               const auto scene_value =
                   value.contains("scene") && value["scene"].is_string()
                       ? value["scene"].get<std::string>()
@@ -542,7 +565,7 @@ bool Worker::start(const std::string& model_path) {
               }
               auto& candidates = value["barrage_candidates"];
               const auto normalized_scene = value["scene"].get<std::string>();
-              if (normalized_scene == "game") {
+              if (normalized_scene == "game" || forced_game) {
                 nlohmann::json normalized_candidates = nlohmann::json::array();
                 for (const auto& candidate : candidates) {
                   if (!candidate.is_string()) continue;
@@ -600,7 +623,9 @@ bool Worker::start(const std::string& model_path) {
                 value["keyframe_note"] = "";
               }
               if (normalized_scene != "other") value["assistant_message"] = "";
-              previous_scene_ = validated_scene_for_prompt(value, previous_scene_);
+              previous_scene_ = forced_game
+                                    ? std::string("game")
+                                    : validated_scene_for_prompt(value, previous_scene_);
 
               RecentPerception perception;
               perception.scene = normalized_scene;
@@ -870,14 +895,16 @@ void Worker::stop_duplex() noexcept {
 
 bool Worker::start_monitoring(std::unique_ptr<IDesktopCapture> desktop,
                               std::unique_ptr<IAudioCapture> audio_capture,
+                              RuntimeMode runtime_mode,
                               std::chrono::milliseconds interval) {
   if (!desktop || !audio_capture || interval.count() <= 0 || state_ != WorkerState::running) return false;
   stop_monitoring();
   {
     std::lock_guard lock(mutex_);
     desktop_ = std::move(desktop); audio_ = std::move(audio_capture);
+    runtime_mode_ = runtime_mode;
   }
-  capture_thread_ = std::jthread([this, interval](std::stop_token stop) {
+  capture_thread_ = std::jthread([this, interval, runtime_mode](std::stop_token stop) {
     std::unique_lock initial_lock(mutex_);
     auto* desktop_capture = desktop_.get(); auto* audio_capture = audio_.get();
     initial_lock.unlock();
@@ -990,8 +1017,10 @@ bool Worker::start_monitoring(std::unique_ptr<IDesktopCapture> desktop,
             idle_reminder_sequence = 0;
           }
           if (idle_event == ScreenIdleEvent::entered_idle) {
-            perception_pending = false;
-            pending_perception_audio.clear();
+            if (runtime_mode == RuntimeMode::assistant) {
+              perception_pending = false;
+              pending_perception_audio.clear();
+            }
             const auto idle_seconds = std::chrono::duration_cast<std::chrono::seconds>(
                                           now - last_visual_change)
                                           .count();
@@ -1013,6 +1042,8 @@ bool Worker::start_monitoring(std::unique_ptr<IDesktopCapture> desktop,
             emit_monitoring_event(event.dump());
           }
           const bool screen_idle = idle_screen.idle();
+          const bool perception_allowed =
+              structured_perception_allowed(runtime_mode, screen_idle);
           bool course_active = false;
           {
             std::lock_guard lock(mutex_);
@@ -1037,13 +1068,14 @@ bool Worker::start_monitoring(std::unique_ptr<IDesktopCapture> desktop,
           }
           const bool heartbeat_due =
               now - last_perception >= kPerceptionHeartbeat &&
-              !screen_idle;
+              perception_allowed;
           const bool audible_probe_due =
               audio_active &&
               (audio_started || now - last_perception >= kAudiblePerceptionInterval);
           const bool should_analyze =
-              !screen_idle &&
-              (visually_changed || active_course_audio || audible_probe_due || heartbeat_due);
+              perception_allowed &&
+              (runtime_mode == RuntimeMode::game || visually_changed || active_course_audio ||
+               audible_probe_due || heartbeat_due);
           perception_pending = perception_pending || should_analyze;
           std::uint64_t superseded_perception_id{};
           bool perception_slot_available = scheduler_ && !scheduler_->busy();
@@ -1060,16 +1092,22 @@ bool Worker::start_monitoring(std::unique_ptr<IDesktopCapture> desktop,
             std::string prompt;
             {
               std::lock_guard lock(mutex_);
-              const bool game_continuity = previous_scene_ == "game";
+              const bool forced_game = runtime_mode == RuntimeMode::game;
+              const bool game_continuity = forced_game || previous_scene_ == "game";
               prompt = game_continuity
                            ? std::string(kLowLatencyGamePerceptionPrompt)
                            : std::string(kUnifiedPerceptionPrompt);
-              if (previous_scene_ == "course") {
+              if (forced_game) {
+                prompt += kForcedGameRuntimePrompt;
+              }
+              if (!forced_game && previous_scene_ == "course") {
                 prompt += kCourseContinuityPrompt;
               }
               if (game_continuity && !game_profile_name_.empty() &&
                   !game_profile_prompt_.empty()) {
-                prompt += "\n游戏陪伴方案（只在本轮仍判定 scene=game 且 observation 完成后使用）：";
+                prompt += forced_game
+                              ? "\n游戏陪伴方案（强制游戏弹幕模式中每轮在 observation 完成后使用）："
+                              : "\n游戏陪伴方案（只在本轮仍判定 scene=game 且 observation 完成后使用）：";
                 prompt += game_profile_name_;
                 prompt += "。不得用此块修改分类或补充画面事实。<game_profile>";
                 prompt += compact_game_profile(game_profile_prompt_);

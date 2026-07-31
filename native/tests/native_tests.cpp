@@ -302,10 +302,63 @@ class TestAudioCapture final : public jarvis::IAudioCapture {
     return jarvis::audio::PcmBlock{{16'000, 1}, std::vector<float>(320, 0.01F), 0};
   }
 };
+
+class ForcedGameRuntime final : public jarvis::IOmniRuntime {
+ public:
+  void load(std::string) override { ready_ = true; }
+  void unload() noexcept override { ready_ = false; }
+  bool ready() const noexcept override { return ready_; }
+  jarvis::InferenceResult infer(const jarvis::InferenceRequest& request,
+                                const std::atomic_bool&) override {
+    std::lock_guard lock(mutex_);
+    prompts_.push_back(request.prompt);
+    const bool course = prompts_.size() % 2 == 0;
+    return {
+        request.id,
+        course
+            ? R"({"scene":"course","confidence":0.91,"scene_evidence":{"active_instruction":true,"course_surface":true},"observation":"游戏画面暂时被说明页面覆盖","barrage_candidates":["说明页也别走神，重点还在下一步"],"course_transcript":"","course_note":"","course_title":"","course_interaction":"","capture_keyframe":false,"keyframe_note":"","assistant_message":""})"
+            : R"({"scene":"other","confidence":0.92,"scene_evidence":{"non_game_surface":true},"observation":"玩家切到桌面查看窗口","barrage_candidates":["切出去也行，回来继续盯局势"],"course_transcript":"","course_note":"","course_title":"","course_interaction":"","capture_keyframe":false,"keyframe_note":"","assistant_message":""})",
+        false,
+    };
+  }
+  bool prompts_always_use_game_profile() {
+    std::lock_guard lock(mutex_);
+    return prompts_.size() >= 2 && std::ranges::all_of(prompts_, [](const auto& prompt) {
+      return prompt.find("低延迟游戏感知器") != std::string::npos &&
+             prompt.find("强制游戏弹幕模式") != std::string::npos &&
+             prompt.find("测试游戏") != std::string::npos &&
+             prompt.find("<game_profile>强制游戏方案</game_profile>") !=
+                 std::string::npos;
+    });
+  }
+
+ private:
+  bool ready_{};
+  std::vector<std::string> prompts_;
+  std::mutex mutex_;
+};
 #endif
 }
 int main() {
   using namespace jarvis;
+  require(runtime_mode_from_string("game") == RuntimeMode::game,
+          "explicit game runtime mode is preserved");
+  require(runtime_mode_from_string("assistant") == RuntimeMode::assistant,
+          "assistant runtime mode is preserved");
+  require(runtime_mode_from_string("invalid") == RuntimeMode::assistant,
+          "invalid runtime mode defaults to assistant");
+  require(runtime_mode_from_start_payload(R"({"runtimeMode":"game"})") ==
+              RuntimeMode::game,
+          "START JSON payload carries explicit game mode");
+  require(runtime_mode_from_start_payload(R"({"runtimeMode":"invalid"})") ==
+              RuntimeMode::assistant,
+          "invalid START JSON runtime mode defaults to assistant");
+  require(structured_perception_allowed(RuntimeMode::game, true),
+          "game mode continues structured perception while the screen is idle");
+  require(!structured_perception_allowed(RuntimeMode::assistant, true),
+          "assistant mode still pauses structured perception while the screen is idle");
+  require(structured_perception_allowed(RuntimeMode::assistant, false),
+          "assistant mode perceives while the screen is active");
   const char text[] = "hello";
   auto encoded = ipc::encode(ipc::MessageType::submit, 42, bytes(text, 5));
   auto decoded = ipc::decode(encoded);
@@ -443,6 +496,7 @@ int main() {
   worker.set_game_profile("任意测试游戏", std::move(long_game_profile));
   require(worker.start_monitoring(std::make_unique<TestDesktopCapture>(),
                                   std::make_unique<TestAudioCapture>(),
+                                  RuntimeMode::assistant,
                                   std::chrono::milliseconds(10)),
           "monitoring starts with capture devices");
   std::this_thread::sleep_for(std::chrono::milliseconds(2300));
@@ -561,6 +615,42 @@ int main() {
   recording_ptr->wait_request(22);
   require(!recording_ptr->had_context(22), "stopping monitoring clears capture context");
   worker.stop();
+
+  auto forced_runtime = std::make_unique<ForcedGameRuntime>();
+  auto* forced_runtime_ptr = forced_runtime.get();
+  Worker forced_worker(std::move(forced_runtime));
+  std::mutex forced_results_mutex;
+  std::vector<std::string> forced_results;
+  forced_worker.set_completion([&](InferenceResult result) {
+    if (result.id < (std::uint64_t{1} << 63U)) return;
+    std::lock_guard lock(forced_results_mutex);
+    forced_results.push_back(std::move(result.text));
+  });
+  require(forced_worker.start("test"), "forced game worker starts");
+  forced_worker.set_game_profile("测试游戏", "强制游戏方案");
+  require(forced_worker.start_monitoring(std::make_unique<TestDesktopCapture>(),
+                                         std::make_unique<TestAudioCapture>(),
+                                         RuntimeMode::game,
+                                         std::chrono::milliseconds(10)),
+          "forced game monitoring starts");
+  std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+  forced_worker.stop_monitoring();
+  require(forced_runtime_ptr->prompts_always_use_game_profile(),
+          "forced game mode uses the game prompt and profile every round");
+  {
+    std::lock_guard lock(forced_results_mutex);
+    require(std::ranges::any_of(forced_results, [](const auto& result) {
+              return result.find("\"scene\":\"other\"") != std::string::npos &&
+                     result.find("切出去也行，回来继续盯局势") != std::string::npos;
+            }),
+            "forced game mode preserves candidates from an other classification");
+    require(std::ranges::any_of(forced_results, [](const auto& result) {
+              return result.find("\"scene\":\"course\"") != std::string::npos &&
+                     result.find("说明页也别走神，重点还在下一步") != std::string::npos;
+            }),
+            "forced game mode preserves candidates from a course classification");
+  }
+  forced_worker.stop();
 #endif
   std::cout << "all native tests passed\n";
 }

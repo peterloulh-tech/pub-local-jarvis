@@ -86,7 +86,14 @@ int NamedPipeServer::run() {
       if (type == ipc::MessageType::shutdown) { request_stop(); break; }
       if (type == ipc::MessageType::start) {
         try {
-          impl_->worker.start_monitoring(make_dxgi_desktop_capture(), make_wasapi_loopback_capture());
+          RuntimeMode runtime_mode = RuntimeMode::assistant;
+          if (!decoded.message.payload.empty()) {
+            const std::string raw(reinterpret_cast<const char*>(decoded.message.payload.data()),
+                                  decoded.message.payload.size());
+            runtime_mode = runtime_mode_from_start_payload(raw);
+          }
+          impl_->worker.start_monitoring(make_dxgi_desktop_capture(),
+                                         make_wasapi_loopback_capture(), runtime_mode);
         } catch (...) {
           const auto response = ipc::encode(ipc::MessageType::error, id, {});
           std::lock_guard lock(impl_->write_mutex);

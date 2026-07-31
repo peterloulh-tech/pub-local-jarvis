@@ -24,6 +24,14 @@ const { moveWithinWorkArea, resizeAroundBottomRight } = require("./pet-window");
 const { randomPrivacyDelay, randomPrivacyMessage } = require("./privacy-mode");
 const { resolveDisplayScene } = require("./scene-policy");
 const {
+  createRuntimeSession,
+  normalizeRuntimeMode,
+  revealFatalError,
+  shouldAcceptBarrage,
+  shouldShowAssistantBubble,
+  syncGameProfileForRuntime,
+} = require("./runtime-mode");
+const {
   defaultSettings,
   loadSettings,
   normalizeProfile,
@@ -81,6 +89,7 @@ const state = {
   inferenceReason: "",
   screenBlocked: false,
   gameProfile: "我的世界",
+  runtimeMode: "assistant",
 };
 
 function selectedGameProfile() {
@@ -232,7 +241,11 @@ function setPetChatVisible(visible) {
     petWindow.setIgnoreMouseEvents(false);
     petWindow.show();
     petWindow.focus();
-  } else if (state.scene === "game" && state.monitoring && !state.screenBlocked) {
+  } else if (
+    (state.runtimeMode === "game" || state.scene === "game") &&
+    state.monitoring &&
+    !state.screenBlocked
+  ) {
     petWindow.hide();
   } else if (state.monitoring) {
     petWindow.showInactive();
@@ -347,9 +360,8 @@ function updateTrayMenu() {
 }
 
 function setScene(sceneValue) {
-  const previousScene = state.scene;
   const scene = ["game", "course", "other"].includes(sceneValue) ? sceneValue : "other";
-  if (scene !== previousScene && petBubbleVisible) {
+  if (scene !== state.scene && petBubbleVisible) {
     clearTimeout(bubbleTimer);
     bubbleTimer = null;
     petBubbleVisible = false;
@@ -363,12 +375,9 @@ function setScene(sceneValue) {
     petWindow.showInactive();
     return;
   }
-  if (scene === "game") {
+  if (state.runtimeMode === "game" || scene === "game") {
     if (!petChatVisible && petWindow.isVisible()) petWindow.hide();
     showBarrage();
-    if (previousScene !== "game") {
-      showBarrage(`已加载《${selectedGameProfile().name}》游戏方案`);
-    }
   } else {
     barrageWindow.hide();
     petWindow.showInactive();
@@ -376,7 +385,7 @@ function setScene(sceneValue) {
 }
 
 function showBubble(effect) {
-  if (state.scene === "game") return;
+  if (!shouldShowAssistantBubble(state.runtimeMode, state.scene)) return;
   clearTimeout(bubbleTimer);
   const duration = effect.duration || Math.min(12000, Math.max(7000, effect.text.length * 180));
   petBubbleVisible = true;
@@ -394,6 +403,7 @@ function showBubble(effect) {
 function restoreCoursePet() {
   if (
     !activeCourseSessionId ||
+    state.runtimeMode === "game" ||
     state.scene !== "course" ||
     !state.monitoring ||
     state.screenBlocked ||
@@ -552,25 +562,28 @@ function handleBackendEvent(event) {
       setScene(resolveDisplayScene(effect.scene));
     }
     if (effect.type === "bubble" && !state.screenBlocked) showBubble(effect);
-    if (effect.type === "idle" && !state.screenBlocked) {
+    if (effect.type === "idle" && !state.screenBlocked && state.runtimeMode !== "game") {
       if (state.scene === "game") showBarrage(effect.text);
       else showBubble(effect);
     }
     if (effect.type === "barrage") {
-      if (state.scene !== "game" || state.screenBlocked) continue;
+      if (!shouldAcceptBarrage(state.runtimeMode, state.scene, state.screenBlocked)) continue;
       showBarrage(effect.text);
     }
     if (effect.type === "capture") captureKeyframe(effect);
     if (effect.type === "fault") {
       publishState({ phase: "error", monitoring: false, error: effect.text });
+      revealFatalError(launcherWindow);
       showBubble({ text: effect.text, tone: "error", duration: 10000 });
     }
   }
 }
 
-async function startJarvis() {
+async function startJarvis(runtimeModeValue = "assistant") {
   if (state.phase === "running") return { ...state };
   if (startPromise) return startPromise;
+  const runtimeMode = normalizeRuntimeMode(runtimeModeValue);
+  const runtimeSession = createRuntimeSession(runtimeMode);
   startPromise = (async () => {
     startController = new AbortController();
     publishState({
@@ -578,12 +591,17 @@ async function startJarvis() {
       environmentStatus: "initializing",
       inferenceBackend: "unknown",
       inferenceReason: "",
+      runtimeMode,
       error: null,
     });
     try {
       await manager.start({ signal: startController.signal });
-      await syncGameProfile({ timeout: 3 * 60 * 1000 });
-      await manager.command("start_monitoring", {}, { timeout: 3 * 60 * 1000 });
+      await syncGameProfileForRuntime(
+        runtimeSession,
+        () => syncGameProfile({ timeout: 3 * 60 * 1000 }),
+        () => showBarrage(`已加载《${selectedGameProfile().name}》游戏方案`),
+      );
+      await manager.command("start_monitoring", { runtimeMode }, { timeout: 3 * 60 * 1000 });
       privacyDesiredVersion = 0;
       privacyAppliedVersion = 0;
       publishState({ phase: "running", monitoring: true, screenBlocked: false, error: null });
@@ -661,7 +679,7 @@ function runDemo() {
 }
 
 function registerIpc() {
-  ipcMain.handle("jarvis:start", startJarvis);
+  ipcMain.handle("jarvis:start", (_event, runtimeMode) => startJarvis(runtimeMode));
   ipcMain.handle("jarvis:cancel-start", cancelStart);
   ipcMain.handle("jarvis:pause", pauseMonitoring);
   ipcMain.handle("jarvis:resume", resumeMonitoring);

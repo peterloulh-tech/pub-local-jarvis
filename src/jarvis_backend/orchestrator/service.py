@@ -137,6 +137,7 @@ class OrchestrationService:
         self._barrage_task: asyncio.Task[None] | None = None
         self._ambient_duplex_task: asyncio.Task[None] | None = None
         self._monitoring_requested = False
+        self.runtime_mode = "assistant"
         self._recent_duplex_messages: deque[tuple[str, float]] = deque(maxlen=4)
         self._recent_assistant_messages: deque[tuple[str, float]] = deque(maxlen=6)
         self._pet_chat_history: deque[tuple[str, str]] = deque(maxlen=4)
@@ -196,7 +197,15 @@ class OrchestrationService:
         if method in {"pause_monitoring", "stop_monitoring"}:
             self._monitoring_requested = False
             await self._cancel_ambient_duplex_start()
-        result = await self.native_client.request(method, arguments)
+        native_arguments = dict(arguments)
+        if method == "start_monitoring":
+            self.runtime_mode = (
+                "game" if native_arguments.get("runtimeMode") == "game" else "assistant"
+            )
+            native_arguments["runtimeMode"] = self.runtime_mode
+        elif method == "resume_monitoring":
+            native_arguments["runtimeMode"] = self.runtime_mode
+        result = await self.native_client.request(method, native_arguments)
         if method in {"start_monitoring", "resume_monitoring"}:
             self._screen_idle = False
             self._monitoring_requested = True
@@ -1037,7 +1046,7 @@ class OrchestrationService:
             return
         if topic == "screen.idle.reminder":
             await self.events.publish(Event(topic, payload))
-            if self._screen_idle:
+            if self._screen_idle and self.runtime_mode != "game":
                 await self.events.publish(
                     Event(
                         "assistant.message",
@@ -1055,7 +1064,7 @@ class OrchestrationService:
             await self.events.publish(Event(topic, payload))
             return
         if topic == "perception.completed":
-            if self._screen_idle:
+            if self._screen_idle and self.runtime_mode != "game":
                 return
             await self._handle_perception(payload)
             return
@@ -1110,7 +1119,9 @@ class OrchestrationService:
         await self.events.publish(Event(topic, payload))
 
     @staticmethod
-    def _parse_perception(text: str) -> dict[str, Any]:
+    def _parse_perception(
+        text: str, *, allow_game_barrage: bool = False
+    ) -> dict[str, Any]:
         start = text.find("{")
         if start < 0:
             raise ValueError("perception response contains no JSON object")
@@ -1215,12 +1226,13 @@ class OrchestrationService:
             candidate_text = str(candidate).strip()[:30]
             if candidate_text and candidate_text not in barrage_candidates:
                 barrage_candidates.append(candidate_text)
-        if scene == "game" and not barrage_candidates and not barrage_pending:
+        barrage_allowed = scene == "game" or allow_game_barrage
+        if barrage_allowed and not barrage_candidates and not barrage_pending:
             barrage_source = "missing_generation"
             barrage_fallback_reason = barrage_fallback_reason or "empty_candidates"
-        elif scene == "game" and barrage_pending:
+        elif barrage_allowed and barrage_pending:
             barrage_source = "pending"
-        elif scene == "game" and barrage_candidates and not barrage_source:
+        elif barrage_allowed and barrage_candidates and not barrage_source:
             barrage_source = "model"
         return {
             "scene": scene,
@@ -1231,8 +1243,8 @@ class OrchestrationService:
             "barrage_source": barrage_source,
             "barrage_fallback_reason": barrage_fallback_reason,
             "observation": observation[:300],
-            "barrage": barrage[:30] if scene == "game" else "",
-            "barrage_candidates": barrage_candidates[:4] if scene == "game" else [],
+            "barrage": barrage[:30] if barrage_allowed else "",
+            "barrage_candidates": barrage_candidates[:4] if barrage_allowed else [],
             "course_transcript": course_transcript[:2000],
             "course_note": course_note[:2000],
             "course_title": str(value.get("course_title", "")).strip()[:128],
@@ -1380,7 +1392,7 @@ class OrchestrationService:
             pass
 
     async def _emit_barrage(self, text: str, metadata: dict[str, Any]) -> bool:
-        if self.display_scene.current != "game":
+        if self.runtime_mode != "game" and self.display_scene.current != "game":
             return False
         now = time.monotonic()
         self._prune_recent_barrages(now)
@@ -1398,7 +1410,10 @@ class OrchestrationService:
                 await asyncio.sleep(
                     self.settings.interaction.game_barrage_interval_seconds
                 )
-                if self.display_scene.current != "game":
+                if (
+                    self.runtime_mode != "game"
+                    and self.display_scene.current != "game"
+                ):
                     return
                 await self._emit_barrage(candidate, metadata)
         finally:
@@ -1418,8 +1433,11 @@ class OrchestrationService:
             )
 
     async def _handle_perception(self, payload: dict[str, Any]) -> None:
+        forced_game = self.runtime_mode == "game"
         try:
-            result = self._parse_perception(str(payload.get("text", "")))
+            result = self._parse_perception(
+                str(payload.get("text", "")), allow_game_barrage=forced_game
+            )
         except (ValueError, json.JSONDecodeError) as exc:
             await self.events.publish(
                 Event(
@@ -1431,7 +1449,8 @@ class OrchestrationService:
 
         scene = result["scene"]
         game_entry_rejected = (
-            scene == "game"
+            not forced_game
+            and scene == "game"
             and self.display_scene.current != "game"
             and not self._has_game_entry_evidence(result)
         )
@@ -1460,9 +1479,10 @@ class OrchestrationService:
         display_scene = self.display_scene.observe(scene, exit_samples=exit_samples)
         result["observed_scene"] = scene
         result["scene"] = display_scene
+        result["runtime_mode"] = self.runtime_mode
         result["uncertain_game_exit"] = uncertain_game_exit
         available_candidates: list[str] = []
-        if scene == "game":
+        if scene == "game" or forced_game:
             available_candidates = self._rank_barrage_candidates(
                 result["barrage_candidates"], now
             )
@@ -1470,6 +1490,17 @@ class OrchestrationService:
 
         await self._record_memory_activity(result, now)
         await self.events.publish(Event("perception.completed", result))
+        if forced_game:
+            if available_candidates:
+                await self._start_barrage_sequence(
+                    available_candidates,
+                    {
+                        "confidence": result["confidence"],
+                        "source": result["barrage_source"],
+                        "fallback_reason": result["barrage_fallback_reason"],
+                    },
+                )
+            return
         if scene == "other" and display_scene == "other":
             await self._emit_ordinary_perception_message(result, now)
         if scene != "game" or display_scene != "game":

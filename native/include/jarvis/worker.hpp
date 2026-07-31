@@ -11,12 +11,18 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 namespace jarvis {
 
 enum class WorkerState : std::uint8_t { stopped, starting, running, stopping, faulted };
+enum class RuntimeMode : std::uint8_t { assistant, game };
+
+RuntimeMode runtime_mode_from_string(std::string_view value) noexcept;
+RuntimeMode runtime_mode_from_start_payload(std::string_view payload) noexcept;
+bool structured_perception_allowed(RuntimeMode runtime_mode, bool screen_idle) noexcept;
 
 class Worker {
  public:
@@ -34,6 +40,7 @@ class Worker {
   void stop_duplex() noexcept;
   bool start_monitoring(std::unique_ptr<IDesktopCapture> desktop,
                         std::unique_ptr<IAudioCapture> audio,
+                        RuntimeMode runtime_mode = RuntimeMode::assistant,
                         std::chrono::milliseconds interval = std::chrono::seconds(1));
   void stop_monitoring() noexcept;
 #endif
@@ -76,6 +83,7 @@ class Worker {
   std::string duplex_instruction_{};
   std::deque<RecentPerception> recent_perceptions_{};
   std::string previous_scene_{};
+  RuntimeMode runtime_mode_{RuntimeMode::assistant};
   std::string game_profile_name_{};
   std::string game_profile_prompt_{};
   std::size_t game_barrage_variant_index_{};

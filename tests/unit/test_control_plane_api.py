@@ -947,6 +947,152 @@ async def test_leaving_game_cancels_queued_barrage_candidates(tmp_path):
     ] == ["先稳住左侧视野"]
 
 
+@pytest.mark.parametrize(
+    ("scene", "scene_evidence"),
+    [
+        ("other", {"non_game_surface": True}),
+        (
+            "course",
+            {
+                "active_instruction": True,
+                "course_surface": True,
+                "instructional_audio": True,
+            },
+        ),
+    ],
+)
+async def test_forced_game_runtime_schedules_barrage_for_any_model_scene(
+    tmp_path, scene, scene_evidence
+):
+    settings = Settings(
+        interaction=InteractionSettings(game_barrage_interval_seconds=0.01),
+        memory=MemorySettings(root=tmp_path / "memory"),
+        courses=CourseSettings(sessions_root=tmp_path / "sessions"),
+    )
+    orchestrator = create_app(settings=settings).state.orchestrator
+    orchestrator.runtime_mode = "game"
+
+    await orchestrator._handle_perception(
+        {
+            "type": "perception.completed",
+            "text": json.dumps(
+                {
+                    "scene": scene,
+                    "confidence": 0.99,
+                    "scene_evidence": scene_evidence,
+                    "observation": "模型保留真实场景作为诊断信息",
+                    "barrage_candidates": ["强制游戏模式继续发送"],
+                },
+                ensure_ascii=False,
+            ),
+        }
+    )
+
+    perception = orchestrator.events.history("perception.completed")[-1].payload
+    assert perception["observed_scene"] == scene
+    assert perception["runtime_mode"] == "game"
+    assert [
+        event.payload["text"]
+        for event in orchestrator.events.history("barrage.generated")
+    ] == ["强制游戏模式继续发送"]
+
+
+async def test_forced_game_runtime_keeps_queued_barrage_across_scene_changes(tmp_path):
+    settings = Settings(
+        interaction=InteractionSettings(game_barrage_interval_seconds=0.05),
+        memory=MemorySettings(root=tmp_path / "memory"),
+        courses=CourseSettings(sessions_root=tmp_path / "sessions"),
+    )
+    orchestrator = create_app(settings=settings).state.orchestrator
+    orchestrator.runtime_mode = "game"
+
+    await orchestrator._handle_perception(
+        {
+            "type": "perception.completed",
+            "text": json.dumps(
+                {
+                    "scene": "other",
+                    "confidence": 0.99,
+                    "scene_evidence": {"non_game_surface": True},
+                    "observation": "当前识别为桌面",
+                    "barrage_candidates": ["第一条继续发送", "第二条不能被场景取消"],
+                },
+                ensure_ascii=False,
+            ),
+        }
+    )
+    await orchestrator._handle_perception(
+        {
+            "type": "perception.completed",
+            "text": json.dumps(
+                {
+                    "scene": "course",
+                    "confidence": 0.99,
+                    "scene_evidence": {
+                        "active_instruction": True,
+                        "course_surface": True,
+                        "instructional_audio": True,
+                    },
+                    "observation": "当前识别为课程",
+                },
+                ensure_ascii=False,
+            ),
+        }
+    )
+    await asyncio.sleep(0.07)
+
+    assert [
+        event.payload["text"]
+        for event in orchestrator.events.history("barrage.generated")
+    ] == ["第一条继续发送", "第二条不能被场景取消"]
+
+
+async def test_screen_idle_only_blocks_assistant_perception(tmp_path):
+    payload = {
+        "type": "perception.completed",
+        "text": json.dumps(
+            {
+                "scene": "other",
+                "confidence": 0.99,
+                "scene_evidence": {"non_game_surface": True},
+                "observation": "静止画面仍需持续感知",
+                "barrage_candidates": ["静止画面也继续处理"],
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+    game_orchestrator = create_app(
+        settings=Settings(
+            memory=MemorySettings(root=tmp_path / "game-memory"),
+            courses=CourseSettings(sessions_root=tmp_path / "game-sessions"),
+        )
+    ).state.orchestrator
+    game_orchestrator.runtime_mode = "game"
+    game_orchestrator._screen_idle = True
+    await game_orchestrator._on_native_event(payload)
+    await game_orchestrator._on_native_event(
+        {"type": "screen.idle.reminder", "idle_seconds": 120}
+    )
+    assert len(game_orchestrator.events.history("perception.completed")) == 1
+    assert game_orchestrator.events.history("assistant.message") == []
+
+    assistant_orchestrator = create_app(
+        settings=Settings(
+            memory=MemorySettings(root=tmp_path / "assistant-memory"),
+            courses=CourseSettings(sessions_root=tmp_path / "assistant-sessions"),
+        )
+    ).state.orchestrator
+    assistant_orchestrator.runtime_mode = "assistant"
+    assistant_orchestrator._screen_idle = True
+    await assistant_orchestrator._on_native_event(payload)
+    await assistant_orchestrator._on_native_event(
+        {"type": "screen.idle.reminder", "idle_seconds": 120}
+    )
+    assert assistant_orchestrator.events.history("perception.completed") == []
+    assert len(assistant_orchestrator.events.history("assistant.message")) == 1
+
+
 def test_game_barrage_semantic_near_duplicates_are_suppressed(tmp_path):
     with make_client(tmp_path) as client:
         native = client.app.state.orchestrator.native_client
@@ -1216,6 +1362,38 @@ def test_monitoring_automatically_manages_ambient_duplex(tmp_path):
             "resume_monitoring",
             "start_duplex",
         ]
+
+
+async def test_runtime_mode_reaches_native_and_survives_pause_resume(tmp_path, monkeypatch):
+    settings = Settings(
+        memory=MemorySettings(root=tmp_path / "memory"),
+        courses=CourseSettings(sessions_root=tmp_path / "sessions"),
+    )
+    orchestrator = create_app(settings=settings).state.orchestrator
+    await orchestrator.start()
+    requests = []
+
+    async def request(method, payload):
+        requests.append((method, payload))
+        return {"ok": True, "method": method, "result": payload}
+
+    async def skip_ambient_duplex():
+        return None
+
+    monkeypatch.setattr(orchestrator.native_client, "request", request)
+    monkeypatch.setattr(orchestrator, "_initialize_ambient_duplex", skip_ambient_duplex)
+    try:
+        await orchestrator.command("start_monitoring", {"runtimeMode": "game"})
+        assert orchestrator.runtime_mode == "game"
+        assert requests[-1] == ("start_monitoring", {"runtimeMode": "game"})
+
+        await orchestrator.command("pause_monitoring", {})
+        await orchestrator.command("resume_monitoring", {})
+
+        assert orchestrator.runtime_mode == "game"
+        assert requests[-1] == ("resume_monitoring", {"runtimeMode": "game"})
+    finally:
+        await orchestrator.stop()
 
 
 async def test_pet_chat_pauses_and_resumes_ambient_duplex(tmp_path, monkeypatch):

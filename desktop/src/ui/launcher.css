@@ -203,6 +203,9 @@ button, select { cursor: pointer; }
 .system-row strong { margin-bottom: 2px; font-size: 12px; font-weight: 670; }
 .system-row small { color: var(--muted); font-size: 10px; }
 .row-value { max-width: 125px; overflow: hidden; color: #53615f; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.runtime-mode-row { cursor: default; }
+.runtime-mode-select { width: 126px; height: 32px; padding: 0 8px; font-size: 10px; }
+.runtime-mode-select:disabled { cursor: not-allowed; color: #899592; background: #f0f3f2; }
 .profile-row { background: transparent; }
 .profile-row:hover { background: #f4f8f6; }
 .row-action { display: inline-flex; align-items: center; gap: 2px; color: var(--teal-dark); font-size: 10px; font-weight: 640; }

@@ -1,6 +1,7 @@
 "use strict";
 
 const { contextBridge, ipcRenderer } = require("electron");
+const { runtimeModeForRender } = require("./runtime-mode");
 
 const subscribe = channel => callback => {
   const listener = (_event, payload) => callback(payload);
@@ -9,7 +10,8 @@ const subscribe = channel => callback => {
 };
 
 contextBridge.exposeInMainWorld("jarvis", {
-  start: () => ipcRenderer.invoke("jarvis:start"),
+  start: runtimeMode => ipcRenderer.invoke("jarvis:start", runtimeMode),
+  runtimeModeForRender: (currentValue, state) => runtimeModeForRender(currentValue, state),
   cancelStart: () => ipcRenderer.invoke("jarvis:cancel-start"),
   pause: () => ipcRenderer.invoke("jarvis:pause"),
   resume: () => ipcRenderer.invoke("jarvis:resume"),

@@ -61,6 +61,14 @@
             <span class="section-note">自动识别场景</span>
           </div>
           <div class="system-list" aria-label="运行能力">
+            <label class="system-row runtime-mode-row" for="runtime-mode-select">
+              <span class="row-icon"><i data-lucide="toggle-right"></i></span>
+              <div><strong>运行模式</strong><small>启动前选择本次运行方式</small></div>
+              <select id="runtime-mode-select" class="runtime-mode-select" aria-label="运行模式">
+                <option value="assistant">普通助手</option>
+                <option value="game">强制游戏弹幕</option>
+              </select>
+            </label>
             <div class="system-row">
               <span class="row-icon"><i data-lucide="scan-line"></i></span>
               <div><strong>持续感知</strong><small>屏幕与系统音频在本机处理</small></div>

@@ -16,6 +16,7 @@ const monitorValue = $("#monitor-value");
 const sceneValue = $("#scene-value");
 const activityLog = $("#activity-log");
 const gameProfileSummary = $("#game-profile-summary");
+const runtimeModeSelect = $("#runtime-mode-select");
 const profileDialog = $("#game-profile-dialog");
 const profileForm = $("#game-profile-form");
 const profileSelect = $("#profile-select");
@@ -155,6 +156,8 @@ function render(state) {
   monitorValue.textContent = state.monitoring ? "感知中" : phase === "paused" ? "已暂停" : "未运行";
   sceneValue.textContent = state.scene === "game" ? `游戏 · ${state.gameProfile}` : sceneNames[state.scene] || "其他";
   gameProfileSummary.textContent = `游戏方案：${state.gameProfile || "我的世界"}`;
+  runtimeModeSelect.value = window.jarvis.runtimeModeForRender(runtimeModeSelect.value, state);
+  runtimeModeSelect.disabled = phase === "starting" || phase === "running" || phase === "paused";
   if (phase === "starting" || initializingEnvironment) {
     if (!wasStarting) {
       lastLoggedDownloadPercent = -5;
@@ -419,7 +422,7 @@ startButton.addEventListener("click", async () => {
     return;
   }
   addLog("已提交启动请求");
-  try { render(await window.jarvis.start()); } catch (error) { addLog(readableError(error)); }
+  try { render(await window.jarvis.start(runtimeModeSelect.value)); } catch (error) { addLog(readableError(error)); }
 });
 
 pauseButton.addEventListener("click", async () => {
