@@ -18,7 +18,7 @@ const transitions = Object.freeze({
   },
 });
 
-function createMonitoringControl({ getState, command, publishState }) {
+function createMonitoringControl({ getState, command, stop: stopBackend, publishState }) {
   let pendingAction = null;
 
   async function transition(action) {
@@ -41,9 +41,42 @@ function createMonitoringControl({ getState, command, publishState }) {
     return { ...getState() };
   }
 
+  async function stop() {
+    const before = { ...getState() };
+    if (pendingAction || !["running", "paused"].includes(before.phase)) return before;
+
+    pendingAction = "stop";
+    publishState({ phase: "stopping", pendingAction: "stop" });
+    try {
+      await stopBackend();
+    } catch (error) {
+      pendingAction = null;
+      publishState({
+        phase: before.phase,
+        monitoring: before.monitoring,
+        runtimeMode: before.runtimeMode,
+        pendingAction: null,
+        error: String(error?.message || "停止失败"),
+      });
+      throw error;
+    }
+
+    pendingAction = null;
+    publishState({
+      phase: "idle",
+      monitoring: false,
+      environmentStatus: "idle",
+      screenBlocked: false,
+      pendingAction: null,
+      error: null,
+    });
+    return { ...getState() };
+  }
+
   return {
     pause: () => transition("pause"),
     resume: () => transition("resume"),
+    stop,
   };
 }
 

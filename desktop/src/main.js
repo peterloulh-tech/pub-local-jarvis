@@ -97,6 +97,7 @@ const state = {
 const monitoringControl = createMonitoringControl({
   getState: () => state,
   command: command => manager.command(command),
+  stop: () => manager.stop(),
   publishState,
 });
 
@@ -588,6 +589,7 @@ function handleBackendEvent(event) {
 }
 
 async function startJarvis(runtimeModeValue = "assistant") {
+  if (state.pendingAction || state.phase === "stopping") return { ...state };
   if (state.phase === "running") return { ...state };
   if (startPromise) return startPromise;
   const runtimeMode = normalizeRuntimeMode(runtimeModeValue);
@@ -678,6 +680,16 @@ async function resumeMonitoring() {
   return result;
 }
 
+async function stopMonitoring() {
+  const result = await monitoringControl.stop();
+  if (result.phase !== "idle") return result;
+  clearTimeout(privacyMessageTimer);
+  send(petWindow, "jarvis:screen-privacy", false);
+  barrageWindow.hide();
+  petWindow.hide();
+  return result;
+}
+
 function runDemo() {
   setTimeout(() => handleBackendEvent({ topic: "assistant.message", payload: { text: "下载任务已经完成，文件可以直接使用。" } }), 1200);
   setTimeout(() => handleBackendEvent({ topic: "perception.completed", payload: { scene: "game" } }), 5500);
@@ -691,6 +703,7 @@ function registerIpc() {
   ipcMain.handle("jarvis:cancel-start", cancelStart);
   ipcMain.handle("jarvis:pause", pauseMonitoring);
   ipcMain.handle("jarvis:resume", resumeMonitoring);
+  ipcMain.handle("jarvis:stop", stopMonitoring);
   ipcMain.handle("jarvis:get-state", () => ({ ...state }));
   ipcMain.handle("jarvis:memory-status", () => manager.memoryStatus());
   ipcMain.handle("jarvis:memory-days", () => manager.memoryDays());
@@ -808,7 +821,7 @@ app.on("before-quit", event => {
   clearInterval(petHitTestTimer);
   stopPetDrag();
   clearTimeout(privacyMessageTimer);
-  Promise.resolve(manager && manager.stop()).finally(() => {
+  Promise.resolve(manager && manager.stop()).catch(() => {}).finally(() => {
     if (tray) tray.destroy();
     for (const window of BrowserWindow.getAllWindows()) window.destroy();
     app.quit();

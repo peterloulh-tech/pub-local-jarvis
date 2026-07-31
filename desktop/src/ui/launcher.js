@@ -3,6 +3,7 @@
 const $ = selector => document.querySelector(selector);
 const startButton = $("#start-button");
 const pauseButton = $("#pause-button");
+const stopButton = $("#stop-button");
 const phaseChip = $("#phase-chip");
 const phaseChipLabel = phaseChip.querySelector("span");
 const statusTitle = $("#status-title");
@@ -59,6 +60,7 @@ const phaseView = {
   starting: ["启动中", "正在启动本地 AI", "正在检查本地模型与自包含运行时。"],
   running: ["运行中", "持续感知已开启", "AI 贾维斯正在本机理解当前环境，并只在必要时介入。"],
   paused: ["已暂停", "环境感知已暂停", "屏幕和系统音频当前不会被采集。"],
+  stopping: ["停止中", "正在停止本地 AI", "正在关闭环境感知、Worker 与本地后端。"],
   error: ["异常", "启动未完成", "请查看运行日志后重试。"],
 };
 
@@ -153,11 +155,16 @@ function render(state) {
   statusDetail.textContent = state.error || (initializingEnvironment
     ? "正在初始化环境感知模型，完成后将自动开始持续理解。"
     : detail);
-  monitorValue.textContent = state.monitoring ? "感知中" : phase === "paused" ? "已暂停" : "未运行";
+  monitorValue.textContent = phase === "stopping"
+    ? "停止中"
+    : state.monitoring ? "感知中" : phase === "paused" ? "已暂停" : "未运行";
   sceneValue.textContent = state.scene === "game" ? `游戏 · ${state.gameProfile}` : sceneNames[state.scene] || "其他";
   gameProfileSummary.textContent = `游戏方案：${state.gameProfile || "我的世界"}`;
   runtimeModeSelect.value = window.jarvis.runtimeModeForRender(runtimeModeSelect.value, state);
-  runtimeModeSelect.disabled = phase === "starting" || phase === "running" || phase === "paused";
+  runtimeModeSelect.disabled = phase === "starting"
+    || phase === "running"
+    || phase === "paused"
+    || phase === "stopping";
   if (phase === "starting" || initializingEnvironment) {
     if (!wasStarting) {
       lastLoggedDownloadPercent = -5;
@@ -166,8 +173,8 @@ function render(state) {
   } else {
     startupProgress.hidden = true;
   }
-  startButton.hidden = phase === "running" || phase === "paused";
-  startButton.disabled = false;
+  startButton.hidden = phase === "running" || phase === "paused" || phase === "stopping";
+  startButton.disabled = Boolean(state.pendingAction);
   const startIcon = document.createElement("i");
   const startLabel = document.createElement("span");
   startIcon.setAttribute("data-lucide", phase === "starting" ? "square" : "power");
@@ -185,6 +192,13 @@ function render(state) {
       ? "正在恢复"
       : phase === "paused" ? "继续感知" : "暂停感知";
   pauseButton.replaceChildren(pauseIcon, pauseLabel);
+  stopButton.hidden = phase !== "running" && phase !== "paused" && phase !== "stopping";
+  stopButton.disabled = Boolean(state.pendingAction) || phase === "stopping";
+  const stopIcon = document.createElement("i");
+  const stopLabel = document.createElement("span");
+  stopIcon.setAttribute("data-lucide", "square");
+  stopLabel.textContent = phase === "stopping" ? "正在停止" : "停止 AI 贾维斯";
+  stopButton.replaceChildren(stopIcon, stopLabel);
   refreshIcons();
 }
 
@@ -437,6 +451,11 @@ pauseButton.addEventListener("click", async () => {
     else if (state.phase === "paused") render(await window.jarvis.resume());
     else render(state);
   } catch (error) { addLog(error.message); }
+});
+
+stopButton.addEventListener("click", async () => {
+  addLog("已提交停止请求");
+  try { render(await window.jarvis.stop()); } catch (error) { addLog(readableError(error)); }
 });
 
 document.querySelectorAll(".view-tab").forEach(tab => tab.addEventListener("click", () => switchView(tab.dataset.view)));

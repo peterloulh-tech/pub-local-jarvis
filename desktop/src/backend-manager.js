@@ -156,9 +156,11 @@ class BackendManager extends EventEmitter {
     this.child = null;
     this.childError = null;
     this.ownsBackend = false;
+    this.connectedBackend = false;
     this.socket = null;
     this.reconnectTimer = null;
     this.stopping = false;
+    this.stopPromise = null;
   }
 
   async request(pathname, options = {}) {
@@ -211,6 +213,7 @@ class BackendManager extends EventEmitter {
       throwIfCancelled(signal);
       this.emit("progress", "检测到正在运行的后端，正在连接");
       await this.waitForEventConnection(signal);
+      this.connectedBackend = true;
       return { owned: false };
     }
     if (this.packaged) {
@@ -235,6 +238,7 @@ class BackendManager extends EventEmitter {
         this.ownsBackend = true;
         this.emit("progress", "后端已就绪");
         await this.waitForEventConnection(signal);
+        this.connectedBackend = true;
         return { owned: true };
       }
       await delay(1000);
@@ -245,6 +249,7 @@ class BackendManager extends EventEmitter {
   async cancelStart() {
     await this.terminateChildTree();
     this.ownsBackend = false;
+    this.connectedBackend = false;
   }
 
   async terminateChildTree() {
@@ -318,7 +323,7 @@ class BackendManager extends EventEmitter {
     });
     this.socket.on("close", () => {
       this.socket = null;
-      if (!this.stopping) {
+      if (!this.stopping && this.connectedBackend) {
         clearTimeout(this.reconnectTimer);
         this.reconnectTimer = setTimeout(() => this.connectEvents(), 2000);
       }
@@ -386,18 +391,41 @@ class BackendManager extends EventEmitter {
     });
   }
 
-  async stop() {
+  async stopManagedBackend() {
+    if (!this.ownsBackend) {
+      if (this.connectedBackend) {
+        throw new Error("当前 Backend 不是由 Electron 启动，无法执行真正停止");
+      }
+      return;
+    }
+
     this.stopping = true;
-    clearTimeout(this.reconnectTimer);
-    if (this.socket) this.socket.close();
-    if (this.ownsBackend) {
+    try {
+      clearTimeout(this.reconnectTimer);
       try {
         await this.command("shutdown", {}, { timeout: 5000 });
       } catch (_) {}
       await delay(800);
       await this.terminateChildTree();
+      if (this.socket) {
+        try { this.socket.close(); } catch (_) {}
+      }
+      this.ownsBackend = false;
+      this.connectedBackend = false;
+    } catch (error) {
+      this.stopping = false;
+      if (this.connectedBackend) this.connectEvents();
+      throw error;
     }
-    this.ownsBackend = false;
+    this.stopping = false;
+  }
+
+  stop() {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopPromise = this.stopManagedBackend().finally(() => {
+      this.stopPromise = null;
+    });
+    return this.stopPromise;
   }
 }
 
