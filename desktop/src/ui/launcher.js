@@ -175,10 +175,15 @@ function render(state) {
   startButton.replaceChildren(startIcon, startLabel);
   startButton.classList.toggle("cancel-command", phase === "starting");
   pauseButton.hidden = phase !== "running" && phase !== "paused";
+  pauseButton.disabled = Boolean(state.pendingAction);
   const pauseIcon = document.createElement("i");
   const pauseLabel = document.createElement("span");
   pauseIcon.setAttribute("data-lucide", phase === "paused" ? "play" : "pause");
-  pauseLabel.textContent = phase === "paused" ? "继续感知" : "暂停感知";
+  pauseLabel.textContent = state.pendingAction === "pause"
+    ? "正在暂停"
+    : state.pendingAction === "resume"
+      ? "正在恢复"
+      : phase === "paused" ? "继续感知" : "暂停感知";
   pauseButton.replaceChildren(pauseIcon, pauseLabel);
   refreshIcons();
 }
@@ -428,7 +433,9 @@ startButton.addEventListener("click", async () => {
 pauseButton.addEventListener("click", async () => {
   try {
     const state = await window.jarvis.getState();
-    render(state.monitoring ? await window.jarvis.pause() : await window.jarvis.resume());
+    if (state.phase === "running") render(await window.jarvis.pause());
+    else if (state.phase === "paused") render(await window.jarvis.resume());
+    else render(state);
   } catch (error) { addLog(error.message); }
 });
 

@@ -18,6 +18,7 @@ const {
 const { BackendManager, StartCancelledError } = require("./backend-manager");
 const { presentBarrageWindow } = require("./barrage-overlay");
 const { routeBackendEvent } = require("./event-router");
+const { createMonitoringControl } = require("./monitoring-control");
 const { displayForWindow, sourceForDisplay } = require("./pet-display");
 const { isPetPointerInteractive } = require("./pet-hit-test");
 const { moveWithinWorkArea, resizeAroundBottomRight } = require("./pet-window");
@@ -90,7 +91,14 @@ const state = {
   screenBlocked: false,
   gameProfile: "我的世界",
   runtimeMode: "assistant",
+  pendingAction: null,
 };
+
+const monitoringControl = createMonitoringControl({
+  getState: () => state,
+  command: command => manager.command(command),
+  publishState,
+});
 
 function selectedGameProfile() {
   return gameSettings.profiles.find(item => item.id === gameSettings.selectedId) || gameSettings.profiles[0];
@@ -651,23 +659,23 @@ async function cancelStart() {
 }
 
 async function pauseMonitoring() {
-  if (!state.monitoring) return { ...state };
-  await manager.command("pause_monitoring");
+  const wasRunning = state.phase === "running";
+  const result = await monitoringControl.pause();
+  if (!wasRunning || result.phase !== "paused") return result;
   clearTimeout(privacyMessageTimer);
   send(petWindow, "jarvis:screen-privacy", false);
   barrageWindow.hide();
   if (petChatVisible) petWindow.show();
   else petWindow.hide();
-  publishState({ phase: "paused", monitoring: false, environmentStatus: "idle", screenBlocked: false });
-  return { ...state };
+  return result;
 }
 
 async function resumeMonitoring() {
-  if (state.phase === "idle") return startJarvis();
-  await manager.command("resume_monitoring");
-  publishState({ phase: "running", monitoring: true });
+  const wasPaused = state.phase === "paused";
+  const result = await monitoringControl.resume();
+  if (!wasPaused || result.phase !== "running") return result;
   setScene(state.scene);
-  return { ...state };
+  return result;
 }
 
 function runDemo() {
