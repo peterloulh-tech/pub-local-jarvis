@@ -205,6 +205,13 @@ jobs:
 
           $requiredFiles = @(
             (Join-Path $cudaBin "nvcc.exe"),
+            (Join-Path $cudaBin "nvcc.profile"),
+            (Join-Path $cudaBin "cudafe++.exe"),
+            (Join-Path $cudaBin "fatbinary.exe"),
+            (Join-Path $cudaBin "nvlink.exe"),
+            (Join-Path $cudaBin "ptxas.exe"),
+            (Join-Path $cudaRoot "nvvm\bin\cicc.exe"),
+            (Join-Path $cudaRoot "nvvm\libdevice\libdevice.10.bc"),
             (Join-Path $cudaRoot "include\cuda_runtime.h"),
             (Join-Path $cudaRoot "include\crt\host_config.h"),
             (Join-Path $cudaRoot "include\crt\host_defines.h"),
@@ -252,7 +259,20 @@ jobs:
           # Import VsDevCmd into this PowerShell process only. GitHub starts the
           # actual build in a later step, so these expanded MSVC variables are not
           # persisted and prepare-release.ps1 can initialize its own clean shell.
-          $originalPSModulePath = $env:PSModulePath
+          $protectedEnvironmentNames = @(
+            "PSModulePath",
+            "HOME",
+            "USERPROFILE",
+            "TEMP",
+            "TMP",
+            "SystemRoot",
+            "ComSpec"
+          )
+          $protectedEnvironment = @{}
+          foreach ($name in $protectedEnvironmentNames) {
+            $protectedEnvironment[$name] =
+              [Environment]::GetEnvironmentVariable($name, "Process")
+          }
           $devEnvironment = & cmd.exe /d /s /c `
             "`"$devCommand`" -no_logo -arch=x64 -host_arch=x64 >nul && set"
           $devEnvironmentExitCode = $LASTEXITCODE
@@ -263,22 +283,56 @@ jobs:
             $separator = $line.IndexOf('=')
             if ($separator -le 0) { continue }
             $name = $line.Substring(0, $separator)
-            if ($name -ieq "PSModulePath") { continue }
+            if ($protectedEnvironmentNames -contains $name) { continue }
             [Environment]::SetEnvironmentVariable(
               $name,
               $line.Substring($separator + 1),
               "Process"
             )
           }
-          $env:PSModulePath = $originalPSModulePath
+          foreach ($name in $protectedEnvironmentNames) {
+            [Environment]::SetEnvironmentVariable(
+              $name,
+              $protectedEnvironment[$name],
+              "Process"
+            )
+          }
+          # NVCC and cl.exe both create intermediate files. Use the hosted
+          # runner's existing temp directory instead of accepting any value
+          # introduced by a developer-environment batch file.
+          $env:TEMP = $env:RUNNER_TEMP
+          $env:TMP = $env:RUNNER_TEMP
+          foreach ($name in @("TEMP", "TMP")) {
+            $tempPath = [Environment]::GetEnvironmentVariable($name, "Process")
+            if (-not (Test-Path -LiteralPath $tempPath -PathType Container)) {
+              throw "$name does not point to an existing directory: $tempPath"
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($env:VSCMD_VER) -or
+              [string]::IsNullOrWhiteSpace($env:INCLUDE) -or
+              [string]::IsNullOrWhiteSpace($env:LIB)) {
+            throw "The CUDA preflight did not receive a complete Visual Studio environment."
+          }
           $resolvedCl = (Get-Command cl.exe -CommandType Application -ErrorAction Stop).Source
+          $resolvedClDirectory = Split-Path -Parent $resolvedCl
+          "JARVIS_NVCC_CCBIN=$resolvedClDirectory" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CUDA preflight cl.exe: $resolvedCl" |
+            Tee-Object -FilePath $installLog -Append
+          "CUDA preflight VSCMD_VER: $env:VSCMD_VER" |
+            Tee-Object -FilePath $installLog -Append
+          "CUDA preflight TEMP: $env:TEMP" |
+            Tee-Object -FilePath $installLog -Append
+          "CUDA preflight TMP: $env:TMP" |
             Tee-Object -FilePath $installLog -Append
           "CUDA preflight PATH length: $($env:PATH.Length)" |
             Tee-Object -FilePath $installLog -Append
 
-          $cudaSmokeSource = Join-Path $env:RUNNER_TEMP "jarvis-cuda-toolchain-smoke.cu"
-          $cudaSmokeObject = Join-Path $env:RUNNER_TEMP "jarvis-cuda-toolchain-smoke.obj"
+          $cudaSmokeRoot = Join-Path $env:RUNNER_TEMP "jarvis-cuda-toolchain-smoke"
+          $cudaSmokeIntermediateRoot = Join-Path $cudaSmokeRoot "intermediate"
+          New-Item -ItemType Directory -Path $cudaSmokeIntermediateRoot -Force | Out-Null
+          $cudaSmokeSource = Join-Path $cudaSmokeRoot "jarvis-cuda-toolchain-smoke.cu"
+          $cudaSmokeObject = Join-Path $cudaSmokeRoot "jarvis-cuda-toolchain-smoke.obj"
           [IO.File]::WriteAllText(
             $cudaSmokeSource,
             'extern "C" __global__ void jarvis_cuda_toolchain_smoke() {}',
@@ -286,6 +340,13 @@ jobs:
           )
           $nvccPath = Join-Path $cudaBin "nvcc.exe"
           $cudaSmokeArguments = @(
+            "--use-local-env",
+            "--compiler-bindir",
+            $resolvedClDirectory,
+            "--verbose",
+            "--keep",
+            "--keep-dir",
+            $cudaSmokeIntermediateRoot,
             "-allow-unsupported-compiler",
             "-arch=sm_75",
             "-c",
@@ -296,19 +357,23 @@ jobs:
           "CUDA preflight command: $nvccPath $($cudaSmokeArguments -join ' ')" |
             Tee-Object -FilePath $installLog -Append
           $cudaSmokeExitCode = 1
-          try {
-            & $nvccPath @cudaSmokeArguments 2>&1 |
-              Tee-Object -FilePath $installLog -Append
-            $cudaSmokeExitCode = $LASTEXITCODE
-          } finally {
-            Remove-Item -LiteralPath $cudaSmokeSource, $cudaSmokeObject `
-              -Force -ErrorAction SilentlyContinue
-          }
+          & $nvccPath @cudaSmokeArguments 2>&1 |
+            Tee-Object -FilePath $installLog -Append
+          $cudaSmokeExitCode = $LASTEXITCODE
           if ($cudaSmokeExitCode -ne 0) {
+            "CUDA smoke-test intermediate files:" |
+              Tee-Object -FilePath $installLog -Append
+            Get-ChildItem -LiteralPath $cudaSmokeRoot -Recurse -Force -ErrorAction SilentlyContinue |
+              ForEach-Object { "$($_.FullName) ($($_.Length) bytes)" } |
+              Tee-Object -FilePath $installLog -Append
             throw "CUDA compiler preflight failed with exit code $cudaSmokeExitCode."
+          }
+          if (-not (Test-Path -LiteralPath $cudaSmokeObject -PathType Leaf)) {
+            throw "CUDA compiler preflight returned success without producing the object file."
           }
           "CUDA compiler preflight passed without executing GPU code." |
             Tee-Object -FilePath $installLog -Append
+          Remove-Item -LiteralPath $cudaSmokeRoot -Recurse -Force
 
       - name: 安装项目依赖
         working-directory: desktop
@@ -484,9 +549,20 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:WINDOWS_POWERSHELL_MODULE_PATH)) {
             throw "WINDOWS_POWERSHELL_MODULE_PATH was not initialized."
           }
+          if ([string]::IsNullOrWhiteSpace($env:JARVIS_NVCC_CCBIN) -or
+              -not (Test-Path -LiteralPath (Join-Path $env:JARVIS_NVCC_CCBIN "cl.exe") -PathType Leaf)) {
+            throw "The validated MSVC host compiler directory was not preserved for the CUDA build."
+          }
           $env:PSModulePath = $env:WINDOWS_POWERSHELL_MODULE_PATH
+          $env:TEMP = $env:RUNNER_TEMP
+          $env:TMP = $env:RUNNER_TEMP
+          $env:NVCC_CCBIN = $env:JARVIS_NVCC_CCBIN
+          $env:NVCC_PREPEND_FLAGS = "--use-local-env"
           $log = Join-Path $env:BUILD_LOG_DIR "npm-build.log"
-          & npm.cmd run build 2>&1 | Tee-Object -FilePath $log
+          "CUDA host compiler directory: $env:NVCC_CCBIN" | Tee-Object -FilePath $log
+          "NVCC prepended flags: $env:NVCC_PREPEND_FLAGS" | Tee-Object -FilePath $log -Append
+          "Build TEMP: $env:TEMP" | Tee-Object -FilePath $log -Append
+          & npm.cmd run build 2>&1 | Tee-Object -FilePath $log -Append
           if ($LASTEXITCODE -ne 0) {
             throw "npm run build failed with exit code $LASTEXITCODE."
           }
