@@ -49,6 +49,7 @@ class Worker {
 
  private:
   std::unique_ptr<IOmniRuntime> runtime_;
+  RuntimeOperationGate runtime_operation_gate_{};
   std::unique_ptr<LatestOnlyScheduler> scheduler_;
   LatestOnlyScheduler::Completion completion_{};
 #ifdef _WIN32
@@ -60,6 +61,7 @@ class Worker {
   };
   std::unique_ptr<IDesktopCapture> desktop_{};
   std::unique_ptr<IAudioCapture> audio_{};
+  std::mutex duplex_control_mutex_{};
   std::jthread capture_thread_{};
   std::jthread duplex_input_thread_{};
   std::jthread duplex_result_thread_{};
@@ -88,6 +90,7 @@ class Worker {
   std::string game_profile_prompt_{};
   std::size_t game_barrage_variant_index_{};
   std::atomic_uint64_t observation_id_{std::uint64_t{1} << 63U};
+  void stop_duplex_locked() noexcept;
   void emit_monitoring_event(std::string payload);
 #endif
   mutable std::mutex mutex_{};

@@ -455,6 +455,196 @@ int main() {
               !idle_screen.idle(),
           "screen change exits idle immediately");
 
+  RuntimeOperationGate runtime_gate;
+  auto active_inference = runtime_gate.begin_inference({});
+  require(active_inference.has_value(),
+          "the first inference acquires the shared runtime gate");
+  require(runtime_gate.request_rebuild() ==
+              RuntimeOperationGate::RebuildRequest::accepted,
+          "the first duplex rebuild request becomes pending");
+  require(runtime_gate.request_rebuild() ==
+              RuntimeOperationGate::RebuildRequest::coalesced,
+          "a duplicate duplex rebuild request is coalesced");
+  std::mutex gate_test_mutex;
+  std::condition_variable gate_test_changed;
+  bool rebuild_waiting{};
+  bool rebuild_entered{};
+  bool release_rebuild{};
+  bool next_inference_waiting{};
+  bool next_inference_entered{};
+  std::size_t rebuild_entries{};
+  std::jthread rebuild_thread([&](std::stop_token stop) {
+    {
+      std::lock_guard lock(gate_test_mutex);
+      rebuild_waiting = true;
+    }
+    gate_test_changed.notify_all();
+    auto rebuild = runtime_gate.begin_rebuild(stop);
+    if (!rebuild) return;
+    {
+      std::lock_guard lock(gate_test_mutex);
+      rebuild_entered = true;
+      ++rebuild_entries;
+    }
+    gate_test_changed.notify_all();
+    {
+      std::unique_lock lock(gate_test_mutex);
+      gate_test_changed.wait(lock, [&] { return release_rebuild; });
+    }
+  });
+  std::jthread next_inference_thread([&](std::stop_token stop) {
+    {
+      std::lock_guard lock(gate_test_mutex);
+      next_inference_waiting = true;
+    }
+    gate_test_changed.notify_all();
+    auto inference = runtime_gate.begin_inference(stop);
+    if (!inference) return;
+    {
+      std::lock_guard lock(gate_test_mutex);
+      next_inference_entered = true;
+    }
+    gate_test_changed.notify_all();
+  });
+  {
+    std::unique_lock lock(gate_test_mutex);
+    require(gate_test_changed.wait_for(
+                lock, std::chrono::seconds(2),
+                [&] { return rebuild_waiting && next_inference_waiting; }),
+            "rebuild and the next inference both reach the runtime gate");
+    require(!rebuild_entered,
+            "duplex rebuild remains pending while inference is active");
+    require(!next_inference_entered,
+            "a pending rebuild prevents the next inference from entering");
+  }
+  active_inference.reset();
+  {
+    std::unique_lock lock(gate_test_mutex);
+    require(gate_test_changed.wait_for(lock, std::chrono::seconds(2),
+                                       [&] { return rebuild_entered; }),
+            "pending duplex rebuild enters after active inference ends");
+    require(!next_inference_entered,
+            "new inference remains blocked while rebuild is active");
+    require(runtime_gate.request_rebuild() ==
+                RuntimeOperationGate::RebuildRequest::coalesced,
+            "a rebuild request made while rebuilding joins the active rebuild");
+    release_rebuild = true;
+  }
+  gate_test_changed.notify_all();
+  rebuild_thread.join();
+  {
+    std::unique_lock lock(gate_test_mutex);
+    require(gate_test_changed.wait_for(lock, std::chrono::seconds(2),
+                                       [&] { return next_inference_entered; }),
+            "next inference enters after duplex rebuild completes");
+  }
+  next_inference_thread.join();
+  require(rebuild_entries == 1,
+          "coalesced duplex rebuild requests execute exactly once");
+
+  RuntimeOperationGate lease_gate;
+  try {
+    auto inference = lease_gate.begin_inference({});
+    require(inference.has_value(), "inference lease is acquired before an exception");
+    throw std::runtime_error("release inference lease");
+  } catch (const std::runtime_error&) {
+  }
+  {
+    auto lifecycle = lease_gate.begin_lifecycle();
+  }
+  const auto return_with_inference_lease = [&] {
+    auto inference = lease_gate.begin_inference({});
+    require(inference.has_value(), "inference lease is acquired before an early return");
+  };
+  return_with_inference_lease();
+  {
+    auto lifecycle = lease_gate.begin_lifecycle();
+  }
+  require(lease_gate.request_rebuild() ==
+              RuntimeOperationGate::RebuildRequest::accepted,
+          "rebuild can be requested for the lease exception test");
+  try {
+    auto rebuild = lease_gate.begin_rebuild({});
+    require(rebuild.has_value(), "rebuild lease is acquired before an exception");
+    throw std::runtime_error("release rebuild lease");
+  } catch (const std::runtime_error&) {
+  }
+  {
+    auto inference = lease_gate.begin_inference({});
+    require(inference.has_value(), "an exception releases the rebuild lease");
+  }
+
+  RuntimeOperationGate stopping_gate;
+  auto stopping_inference = stopping_gate.begin_inference({});
+  require(stopping_inference.has_value(),
+          "inference can be active when duplex stop begins");
+  require(stopping_gate.request_rebuild() ==
+              RuntimeOperationGate::RebuildRequest::accepted,
+          "rebuild can become pending before duplex stop");
+  stopping_gate.close_rebuild_requests();
+  require(stopping_gate.request_rebuild() ==
+              RuntimeOperationGate::RebuildRequest::rejected,
+          "duplex stop rejects a result-thread rebuild request");
+  require(!stopping_gate.begin_rebuild({}),
+          "duplex stop prevents a delayed pending rebuild from executing");
+  stopping_inference.reset();
+  {
+    auto lifecycle = stopping_gate.begin_lifecycle();
+  }
+  {
+    auto inference = stopping_gate.begin_inference({});
+    require(inference.has_value(),
+            "duplex stop leaves no pending rebuild that blocks later inference");
+  }
+
+  RuntimeOperationGate concurrent_stop_gate;
+  std::mutex stop_race_mutex;
+  std::condition_variable stop_race_changed;
+  bool result_thread_ready{};
+  bool publish_after_stop{};
+  bool result_thread_done{};
+  auto stop_race_result = RuntimeOperationGate::RebuildRequest::accepted;
+  std::jthread stopped_result_thread([&] {
+    {
+      std::unique_lock lock(stop_race_mutex);
+      result_thread_ready = true;
+      stop_race_changed.notify_all();
+      stop_race_changed.wait(lock, [&] { return publish_after_stop; });
+    }
+    stop_race_result = concurrent_stop_gate.request_rebuild();
+    {
+      std::lock_guard lock(stop_race_mutex);
+      result_thread_done = true;
+    }
+    stop_race_changed.notify_all();
+  });
+  {
+    std::unique_lock lock(stop_race_mutex);
+    require(stop_race_changed.wait_for(lock, std::chrono::seconds(2),
+                                       [&] { return result_thread_ready; }),
+            "result producer reaches the stop race boundary");
+  }
+  concurrent_stop_gate.close_rebuild_requests();
+  {
+    std::lock_guard lock(stop_race_mutex);
+    publish_after_stop = true;
+  }
+  stop_race_changed.notify_all();
+  {
+    std::unique_lock lock(stop_race_mutex);
+    require(stop_race_changed.wait_for(lock, std::chrono::seconds(2),
+                                       [&] { return result_thread_done; }),
+            "result producer finishes its rebuild attempt after stop");
+  }
+  stopped_result_thread.join();
+  require(stop_race_result == RuntimeOperationGate::RebuildRequest::rejected,
+          "a result producer cannot publish rebuild after stop begins");
+  {
+    auto inference = concurrent_stop_gate.begin_inference({});
+    require(inference.has_value(),
+            "joining a stopped result producer leaves the runtime gate reusable");
+  }
+
   std::ostringstream scheduler_diagnostics;
   auto* previous_cerr = std::cerr.rdbuf(scheduler_diagnostics.rdbuf());
   auto runtime = make_stub_omni_runtime(); runtime->load("stub");
@@ -464,7 +654,9 @@ int main() {
   for (int i = 0; i < 100 && scheduler.busy(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
   scheduler.stop();
   ThrowingRuntime throwing;
-  LatestOnlyScheduler failing_scheduler(throwing, [](InferenceResult) {});
+  RuntimeOperationGate failing_scheduler_gate;
+  LatestOnlyScheduler failing_scheduler(throwing, [](InferenceResult) {},
+                                         &failing_scheduler_gate);
   failing_scheduler.start();
   failing_scheduler.submit(
       {InferenceRequest{.id=8, .prompt="test failure"}, Priority::interactive});
@@ -472,6 +664,11 @@ int main() {
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
   failing_scheduler.stop();
+  {
+    auto inference = failing_scheduler_gate.begin_inference({});
+    require(inference.has_value(),
+            "a runtime inference exception releases the scheduler gate lease");
+  }
   std::cerr.rdbuf(previous_cerr);
   { std::lock_guard lock(mutex); require(!results.empty() && results.back().id == 7, "scheduler invokes runtime"); }
   const auto scheduler_log = scheduler_diagnostics.str();

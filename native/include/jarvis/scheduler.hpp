@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -28,11 +29,54 @@ struct SchedulerDiagnostics {
   std::chrono::milliseconds active_elapsed{};
 };
 
+class RuntimeOperationGate {
+ public:
+  class Lease {
+   public:
+    ~Lease();
+    Lease(const Lease&) = delete;
+    Lease& operator=(const Lease&) = delete;
+    Lease(Lease&& other) noexcept;
+    Lease& operator=(Lease&& other) noexcept;
+
+   private:
+    friend class RuntimeOperationGate;
+    Lease(RuntimeOperationGate& gate, bool inference) noexcept;
+    void release() noexcept;
+
+    RuntimeOperationGate* gate_{};
+    bool inference_{};
+  };
+
+  enum class RebuildRequest : std::uint8_t { accepted, coalesced, rejected };
+
+  [[nodiscard]] std::optional<Lease> begin_inference(std::stop_token stop);
+  [[nodiscard]] RebuildRequest request_rebuild() noexcept;
+  [[nodiscard]] std::optional<Lease> begin_rebuild(std::stop_token stop);
+  [[nodiscard]] Lease begin_lifecycle();
+  void close_rebuild_requests() noexcept;
+  void open_rebuild_requests() noexcept;
+
+ private:
+  void end_inference() noexcept;
+  void end_lifecycle() noexcept;
+
+  std::mutex mutex_{};
+  std::condition_variable_any ready_{};
+  bool inference_active_{};
+  bool rebuild_pending_{};
+  bool rebuild_active_{};
+  bool lifecycle_active_{};
+  bool rebuild_requests_open_{true};
+  std::size_t lifecycle_waiters_{};
+};
+
 class LatestOnlyScheduler {
  public:
   using Completion = std::function<void(InferenceResult)>;
 
-  LatestOnlyScheduler(IOmniRuntime& runtime, Completion completion);
+  LatestOnlyScheduler(IOmniRuntime& runtime, Completion completion,
+                      RuntimeOperationGate* operation_gate = nullptr);
   ~LatestOnlyScheduler();
   LatestOnlyScheduler(const LatestOnlyScheduler&) = delete;
   LatestOnlyScheduler& operator=(const LatestOnlyScheduler&) = delete;
@@ -48,6 +92,8 @@ class LatestOnlyScheduler {
   void run(std::stop_token stop);
 
   IOmniRuntime& runtime_;
+  RuntimeOperationGate owned_operation_gate_{};
+  RuntimeOperationGate* operation_gate_{};
   Completion completion_;
   mutable std::mutex mutex_{};
   std::condition_variable_any ready_{};

@@ -668,7 +668,7 @@ bool Worker::start(const std::string& model_path) {
       }
       if (discard_stale_perception) return;
       if (callback) callback(std::move(r));
-    });
+    }, &runtime_operation_gate_);
     scheduler_->start(); state_ = WorkerState::running; return true;
   } catch (...) { state_ = WorkerState::faulted; return false; }
 }
@@ -710,15 +710,22 @@ void Worker::set_game_profile(std::string name, std::string prompt) {
 }
 #ifdef _WIN32
 bool Worker::start_duplex(std::string session_id, std::string instruction) {
+  std::lock_guard control_lock(duplex_control_mutex_);
   if (session_id.empty() || instruction.empty() || instruction.size() > 8000 ||
       instruction.find('\0') != std::string::npos || !capture_thread_.joinable()) return false;
-  stop_duplex();
+  stop_duplex_locked();
   const auto operation_generation = duplex_operation_generation_.load();
-  if (!runtime_->start_duplex(instruction)) return false;
-  if (operation_generation != duplex_operation_generation_.load()) {
-    runtime_->stop_duplex();
-    return false;
+  bool runtime_started{};
+  {
+    auto runtime_lifecycle = runtime_operation_gate_.begin_lifecycle();
+    runtime_started = runtime_->start_duplex(instruction);
+    if (runtime_started &&
+        operation_generation != duplex_operation_generation_.load()) {
+      runtime_->stop_duplex();
+      runtime_started = false;
+    }
   }
+  if (!runtime_started) return false;
   {
     std::lock_guard lock(mutex_);
     duplex_session_id_ = std::move(session_id);
@@ -729,6 +736,7 @@ bool Worker::start_duplex(std::string session_id, std::string instruction) {
   duplex_completed_frames_.store(0);
   duplex_rebuild_requested_.store(false);
   duplex_rebuilding_.store(false);
+  runtime_operation_gate_.open_rebuild_requests();
   duplex_task_active_.store(true);
   try {
     duplex_input_thread_ = std::jthread([this](std::stop_token stop) {
@@ -781,7 +789,16 @@ bool Worker::start_duplex(std::string session_id, std::string instruction) {
       emit_monitoring_event(event.dump());
       const auto completed = duplex_completed_frames_.fetch_add(1) + 1;
       if (completed >= kDuplexRecycleCompletedFrames &&
+          duplex_task_active_.load() &&
           !duplex_rebuild_requested_.exchange(true)) {
+        const auto rebuild_request = runtime_operation_gate_.request_rebuild();
+        if (rebuild_request == RuntimeOperationGate::RebuildRequest::rejected) {
+          duplex_rebuild_requested_.store(false);
+          continue;
+        }
+        if (rebuild_request == RuntimeOperationGate::RebuildRequest::coalesced) {
+          continue;
+        }
         nlohmann::json recycle_event{
             {"native_event", "duplex.rebuild.requested"},
             {"session_id", session_id},
@@ -814,19 +831,34 @@ bool Worker::start_duplex(std::string session_id, std::string instruction) {
           instruction = duplex_instruction_;
         }
         bool rebuilt = false;
-        try {
-          rebuilt = runtime_->start_duplex(instruction);
-        } catch (const std::exception& error) {
-          std::cerr << "Jarvis duplex context rebuild failed: " << error.what()
-                    << '\n';
-        } catch (...) {
-          std::cerr << "Jarvis duplex context rebuild failed: unknown error\n";
+        {
+          auto runtime_lifecycle = runtime_operation_gate_.begin_rebuild(stop);
+          if (!runtime_lifecycle) {
+            duplex_rebuild_requested_.store(false);
+            duplex_rebuilding_.store(false);
+            duplex_input_ready_.notify_all();
+            break;
+          }
+          if (stop.stop_requested() || !duplex_task_active_.load()) {
+            duplex_rebuild_requested_.store(false);
+            duplex_rebuilding_.store(false);
+            duplex_input_ready_.notify_all();
+            break;
+          }
+          try {
+            rebuilt = runtime_->start_duplex(instruction);
+          } catch (const std::exception& error) {
+            std::cerr << "Jarvis duplex context rebuild failed: " << error.what()
+                      << '\n';
+          } catch (...) {
+            std::cerr << "Jarvis duplex context rebuild failed: unknown error\n";
+          }
         }
-        if (!duplex_task_active_.load()) {
+        if (!duplex_task_active_.load() || stop.stop_requested()) {
           duplex_rebuild_requested_.store(false);
           duplex_rebuilding_.store(false);
           duplex_input_ready_.notify_all();
-          continue;
+          break;
         }
         if (rebuilt) {
           const auto completed = duplex_completed_frames_.exchange(0);
@@ -842,6 +874,7 @@ bool Worker::start_duplex(std::string session_id, std::string instruction) {
         }
 
         duplex_task_active_.store(false);
+        runtime_operation_gate_.close_rebuild_requests();
         duplex_rebuild_requested_.store(false);
         duplex_rebuilding_.store(false);
         duplex_input_ready_.notify_all();
@@ -863,7 +896,7 @@ bool Worker::start_duplex(std::string session_id, std::string instruction) {
       }
     });
   } catch (...) {
-    stop_duplex();
+    stop_duplex_locked();
     return false;
   }
   nlohmann::json event{{"native_event", "duplex.started"},
@@ -873,9 +906,14 @@ bool Worker::start_duplex(std::string session_id, std::string instruction) {
 }
 
 void Worker::stop_duplex() noexcept {
+  std::lock_guard control_lock(duplex_control_mutex_);
+  stop_duplex_locked();
+}
+
+void Worker::stop_duplex_locked() noexcept {
   duplex_operation_generation_.fetch_add(1);
   const bool was_active = duplex_task_active_.exchange(false);
-  duplex_rebuild_requested_.store(false);
+  runtime_operation_gate_.close_rebuild_requests();
   duplex_input_ready_.notify_all();
   duplex_maintenance_ready_.notify_all();
   if (duplex_input_thread_.joinable()) {
@@ -890,8 +928,13 @@ void Worker::stop_duplex() noexcept {
   if (duplex_input_thread_.joinable()) duplex_input_thread_.join();
   if (duplex_result_thread_.joinable()) duplex_result_thread_.join();
   if (duplex_maintenance_thread_.joinable()) duplex_maintenance_thread_.join();
-  runtime_->stop_duplex();
+  runtime_operation_gate_.close_rebuild_requests();
+  duplex_rebuild_requested_.store(false);
   duplex_rebuilding_.store(false);
+  {
+    auto runtime_lifecycle = runtime_operation_gate_.begin_lifecycle();
+    runtime_->stop_duplex();
+  }
   duplex_completed_frames_.store(0);
   std::string session_id;
   {
