@@ -50,8 +50,19 @@ constexpr std::size_t kGameProfileTailBytes = 900;
 constexpr std::string_view kTextOnlyPrefix = "[[JARVIS_TEXT_ONLY]]\n";
 #ifdef _WIN32
 constexpr std::uint32_t kDuplexRecycleCompletedFrames = 24;
+constexpr auto kInferenceStallThreshold = std::chrono::seconds(60);
+constexpr auto kInferenceStallCheckInterval = std::chrono::seconds(1);
 #endif
 #ifdef _WIN32
+void append_scheduler_diagnostics(nlohmann::json& event,
+                                  const LatestOnlyScheduler* scheduler) {
+  const auto diagnostics =
+      scheduler ? scheduler->diagnostics() : SchedulerDiagnostics{};
+  event["scheduler_busy"] = diagnostics.busy;
+  event["active_inference_id"] = diagnostics.active_id;
+  event["active_inference_elapsed_ms"] = diagnostics.active_elapsed.count();
+}
+
 bool is_game_launcher_window(std::uintptr_t window_value) noexcept {
   const auto window = reinterpret_cast<HWND>(window_value);
   if (window == nullptr) return false;
@@ -775,6 +786,7 @@ bool Worker::start_duplex(std::string session_id, std::string instruction) {
             {"native_event", "duplex.rebuild.requested"},
             {"session_id", session_id},
             {"completed_frames", completed}};
+        append_scheduler_diagnostics(recycle_event, scheduler_.get());
         emit_monitoring_event(recycle_event.dump());
         duplex_maintenance_ready_.notify_one();
       }
@@ -824,6 +836,7 @@ bool Worker::start_duplex(std::string session_id, std::string instruction) {
           nlohmann::json event{{"native_event", "duplex.rebuilt"},
                                {"session_id", session_id},
                                {"completed_frames", completed}};
+          append_scheduler_diagnostics(event, scheduler_.get());
           emit_monitoring_event(event.dump());
           continue;
         }
@@ -841,6 +854,7 @@ bool Worker::start_duplex(std::string session_id, std::string instruction) {
         nlohmann::json failed_event{{"native_event", "duplex.failed"},
                                     {"session_id", session_id},
                                     {"reason", "context_rebuild_failed"}};
+        append_scheduler_diagnostics(failed_event, scheduler_.get());
         emit_monitoring_event(failed_event.dump());
         nlohmann::json stopped_event{{"native_event", "duplex.stopped"},
                                      {"session_id", session_id}};
@@ -929,6 +943,8 @@ bool Worker::start_monitoring(std::unique_ptr<IDesktopCapture> desktop,
     ScreenIdleMonitor idle_screen;
     bool first_frame_logged = false;
     auto last_capture_error = std::chrono::steady_clock::time_point{};
+    auto next_inference_stall_check = deadline;
+    std::uint64_t stalled_inference_id{};
     std::vector<float> rolling_audio;
     std::vector<float> pending_perception_audio;
     while (!stop.stop_requested()) {
@@ -1184,6 +1200,28 @@ bool Worker::start_monitoring(std::unique_ptr<IDesktopCapture> desktop,
         if (now - last_capture_error >= std::chrono::seconds(5)) {
           std::cerr << "Jarvis monitoring capture tick failed: unknown error" << '\n';
           last_capture_error = now;
+        }
+      }
+      const auto diagnostic_now = std::chrono::steady_clock::now();
+      if (diagnostic_now >= next_inference_stall_check) {
+        next_inference_stall_check = diagnostic_now + kInferenceStallCheckInterval;
+        if (scheduler_) {
+          const auto diagnostics = scheduler_->diagnostics();
+          if (diagnostics.active_id != 0 &&
+              diagnostics.active_elapsed >= kInferenceStallThreshold &&
+              stalled_inference_id != diagnostics.active_id) {
+            stalled_inference_id = diagnostics.active_id;
+            nlohmann::json stalled_event{
+                {"native_event", "infer.stalled"},
+                {"inference_id", diagnostics.active_id},
+                {"monotonic_ms",
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     diagnostic_now.time_since_epoch())
+                     .count()},
+                {"elapsed_ms", diagnostics.active_elapsed.count()},
+                {"scheduler_busy", diagnostics.busy}};
+            std::cerr << stalled_event.dump() << '\n';
+          }
         }
       }
       std::this_thread::sleep_until(deadline);

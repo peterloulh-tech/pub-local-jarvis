@@ -16,7 +16,9 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <span>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -66,6 +68,16 @@ class BlockingRuntime final : public jarvis::IOmniRuntime {
   void release() { { std::lock_guard lock(mutex_); released_ = true; } changed_.notify_all(); }
  private:
   bool ready_{true}; bool active_{}; bool released_{}; std::mutex mutex_; std::condition_variable changed_;
+};
+class ThrowingRuntime final : public jarvis::IOmniRuntime {
+ public:
+  void load(std::string) override {}
+  void unload() noexcept override {}
+  bool ready() const noexcept override { return true; }
+  jarvis::InferenceResult infer(const jarvis::InferenceRequest&,
+                                const std::atomic_bool&) override {
+    throw std::runtime_error("expected test failure");
+  }
 };
 #ifdef _WIN32
 class RecordingRuntime final : public jarvis::IOmniRuntime {
@@ -443,13 +455,41 @@ int main() {
               !idle_screen.idle(),
           "screen change exits idle immediately");
 
+  std::ostringstream scheduler_diagnostics;
+  auto* previous_cerr = std::cerr.rdbuf(scheduler_diagnostics.rdbuf());
   auto runtime = make_stub_omni_runtime(); runtime->load("stub");
   std::mutex mutex; std::vector<InferenceResult> results;
   LatestOnlyScheduler scheduler(*runtime, [&](InferenceResult r) { std::lock_guard lock(mutex); results.push_back(std::move(r)); });
   scheduler.start(); scheduler.submit({InferenceRequest{.id=7, .prompt="test"}, Priority::interactive});
   for (int i = 0; i < 100 && scheduler.busy(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
   scheduler.stop();
+  ThrowingRuntime throwing;
+  LatestOnlyScheduler failing_scheduler(throwing, [](InferenceResult) {});
+  failing_scheduler.start();
+  failing_scheduler.submit(
+      {InferenceRequest{.id=8, .prompt="test failure"}, Priority::interactive});
+  for (int i = 0; i < 100 && failing_scheduler.busy(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  failing_scheduler.stop();
+  std::cerr.rdbuf(previous_cerr);
   { std::lock_guard lock(mutex); require(!results.empty() && results.back().id == 7, "scheduler invokes runtime"); }
+  const auto scheduler_log = scheduler_diagnostics.str();
+  require(scheduler_log.find(
+              "\"native_event\":\"infer.begin\",\"inference_id\":7") !=
+                  std::string::npos &&
+              scheduler_log.find(
+                  "\"native_event\":\"infer.end\",\"inference_id\":7") !=
+                  std::string::npos &&
+              scheduler_log.find("\"elapsed_ms\":") != std::string::npos,
+          "successful inference emits structured begin and end diagnostics");
+  require(scheduler_log.find(
+              "\"native_event\":\"infer.failed\",\"inference_id\":8") !=
+                  std::string::npos,
+          "failed inference emits a structured failure diagnostic");
+  require(scheduler_log.find("test failure") == std::string::npos &&
+              scheduler_log.find("\"prompt\"") == std::string::npos,
+          "inference diagnostics exclude prompt content");
 
   BlockingRuntime blocking; std::vector<InferenceResult> ordered; std::mutex ordered_mutex;
   LatestOnlyScheduler coalescing(blocking, [&](InferenceResult r) {
@@ -594,14 +634,24 @@ int main() {
               return event.find("\"native_event\":\"duplex.rebuild.requested\"") !=
                          std::string::npos &&
                      event.find("\"completed_frames\":24") !=
+                         std::string::npos &&
+                     event.find("\"scheduler_busy\":") != std::string::npos &&
+                     event.find("\"active_inference_id\":") !=
+                         std::string::npos &&
+                     event.find("\"active_inference_elapsed_ms\":") !=
                          std::string::npos;
             }),
-            "duplex context rebuild is requested at the safe horizon");
+            "duplex rebuild request includes scheduler diagnostics");
     require(std::ranges::any_of(native_events, [](const auto& event) {
               return event.find("\"native_event\":\"duplex.rebuilt\"") !=
-                     std::string::npos;
+                         std::string::npos &&
+                     event.find("\"scheduler_busy\":") != std::string::npos &&
+                     event.find("\"active_inference_id\":") !=
+                         std::string::npos &&
+                     event.find("\"active_inference_elapsed_ms\":") !=
+                         std::string::npos;
             }),
-            "duplex context rebuild emits a completion event");
+            "duplex rebuild completion includes scheduler diagnostics");
   }
   worker.stop_duplex();
   worker.submit_prompt(21, "describe context");

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -31,6 +32,24 @@ constexpr std::int32_t kDefaultMaxOutputTokens = 1024;
 
 std::string path_string(const fs::path& path) {
   return path.string();
+}
+
+void log_inference_stage(std::string_view event, std::uint64_t inference_id,
+                         std::chrono::steady_clock::time_point started_at,
+                         std::chrono::steady_clock::time_point now) noexcept {
+  try {
+    const auto monotonic_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  now.time_since_epoch())
+                                  .count();
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - started_at).count();
+    std::ostringstream line;
+    line << "{\"native_event\":\"" << event << "\",\"inference_id\":"
+         << inference_id << ",\"monotonic_ms\":" << monotonic_ms
+         << ",\"elapsed_ms\":" << elapsed_ms << '}';
+    std::cerr << line.str() << '\n';
+  } catch (...) {
+  }
 }
 
 void write_u16(std::ostream& stream, std::uint16_t value) {
@@ -251,10 +270,24 @@ class RealOmniRuntime final : public IOmniRuntime {
       context_->text_done_flag = false;
     }
     const auto index = static_cast<int>(++round_);
-    if (!stream_prefill(context_, audio_path, image_path, index, -1, request.prompt)) {
+    const auto prefill_started_at = std::chrono::steady_clock::now();
+    log_inference_stage("prefill.begin", request.id, prefill_started_at,
+                        prefill_started_at);
+    const bool prefill_ok =
+        stream_prefill(context_, audio_path, image_path, index, -1, request.prompt);
+    log_inference_stage("prefill.end", request.id, prefill_started_at,
+                        std::chrono::steady_clock::now());
+    if (!prefill_ok) {
       throw std::runtime_error("MiniCPM-o prefill failed");
     }
-    if (!stream_decode(context_, path_string(fs::temp_directory_path()), index - 1)) {
+    const auto decode_started_at = std::chrono::steady_clock::now();
+    log_inference_stage("decode.begin", request.id, decode_started_at,
+                        decode_started_at);
+    const bool decode_ok =
+        stream_decode(context_, path_string(fs::temp_directory_path()), index - 1);
+    log_inference_stage("decode.end", request.id, decode_started_at,
+                        std::chrono::steady_clock::now());
+    if (!decode_ok) {
       throw std::runtime_error("MiniCPM-o decode failed");
     }
     if (cancel.load()) return {request.id, {}, true};

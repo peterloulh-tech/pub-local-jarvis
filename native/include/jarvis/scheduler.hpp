@@ -3,6 +3,7 @@
 #include "jarvis/runtime.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -21,6 +22,12 @@ struct ScheduledRequest {
   Priority priority{Priority::normal};
 };
 
+struct SchedulerDiagnostics {
+  bool busy{};
+  std::uint64_t active_id{};
+  std::chrono::milliseconds active_elapsed{};
+};
+
 class LatestOnlyScheduler {
  public:
   using Completion = std::function<void(InferenceResult)>;
@@ -35,6 +42,7 @@ class LatestOnlyScheduler {
   void submit(ScheduledRequest request);
   void cancel(std::uint64_t request_id) noexcept;
   [[nodiscard]] bool busy() const noexcept;
+  [[nodiscard]] SchedulerDiagnostics diagnostics() const noexcept;
 
  private:
   void run(std::stop_token stop);
@@ -47,6 +55,7 @@ class LatestOnlyScheduler {
   std::uint64_t next_generation_{};
   std::uint64_t current_generation_{};
   std::uint64_t active_id_{};
+  std::chrono::steady_clock::time_point active_started_at_{};
   Priority active_priority_{Priority::background};
   std::shared_ptr<std::atomic_bool> active_cancel_{};
   std::jthread thread_{};
