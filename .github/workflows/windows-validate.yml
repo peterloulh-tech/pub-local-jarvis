@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - feature-forced-game-mode
+      - feature-runtime-lifecycle
 
 permissions:
   contents: read
